@@ -1,0 +1,577 @@
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0                Date 06/13/2026  Time 20:07:55   Page     1               
+0Invocation parameters:
+ ADDR(64)
+0Options in effect:
+  NOADATA                                                                                                                            
+    ADDR(64)                                                                                                                         
+    QUOTE                                                                                                                            
+    ARITH(COMPAT)                                                                                                                    
+    BINARY(NATIVE)                                                                                                                   
+    CALLINT(NODESCRIPTOR)                                                                                                            
+    CHAR(NATIVE)                                                                                                                     
+  NOCICS                                                                                                                             
+    COLLSEQ(BINARY)                                                                                                                  
+  NOCOMPILE(S)                                                                                                                       
+  NOCURRENCY                                                                                                                         
+    DATETIME(1900,40)                                                                                                                
+  NODATEPROC                                                                                                                         
+  NODEFINE                                                                                                                           
+  NODIAGTRUNC                                                                                                                        
+  NODYNAM                                                                                                                            
+  NOEXIT                                                                                                                             
+    FLAG(I,I)                                                                                                                        
+  NOFLAGSTD                                                                                                                          
+    FLOAT(NATIVE)                                                                                                                    
+    LINECOUNT(60)                                                                                                                    
+  NOLIST                                                                                                                             
+    LSTFILE(LOCALE)                                                                                                                  
+  NOMAP                                                                                                                              
+  NOMDECK                                                                                                                            
+    NCOLLSEQ(BINARY)                                                                                                                 
+    NSYMBOL(NATIONAL)                                                                                                                
+  NONUMBER                                                                                                                           
+  NOOPTIMIZE                                                                                                                         
+    PGMNAME(LONGUPPER)                                                                                                               
+    SEPOBJ                                                                                                                           
+    SEQUENCE                                                                                                                         
+  NOSOSI                                                                                                                             
+    SOURCE                                                                                                                           
+    SPACE(1)                                                                                                                         
+    SPILL(512)                                                                                                                       
+  NOSQL                                                                                                                              
+    SRCFORMAT(COMPAT)                                                                                                                
+  NOSSRANGE                                                                                                                          
+    TERM                                                                                                                             
+  NOTEST                                                                                                                             
+  NOTHREAD                                                                                                                           
+    TRUNC(STD)                                                                                                                       
+    UTF16(NATIVE)                                                                                                                    
+  NOVBREF                                                                                                                            
+  NOWSCLEAR                                                                                                                          
+    XREF(FULL)                                                                                                                       
+    YEARWINDOW(1900)                                                                                                                 
+    ZWB                                                                                                                              
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      DICTENC   Date 06/13/2026  Time 20:07:55   Page     2               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000001                IDENTIFICATION DIVISION.                                                 |                                  
+   000002                PROGRAM-ID.    DICTENC.                                                  |                                  
+   000003                AUTHOR.        FRASER.                                                   |                                  
+   000004               ******************************************************************        |                                  
+   000005               * Program     : DICTENC.CBL                                               |                                  
+   000006               * Application : Tiny Pointers lab -- COBOL dictionary encoder             |                                  
+   000007               * Type        : Batch COBOL Program                                       |                                  
+   000008               * Function    : Dictionary-encode a low-cardinality string COLUMN         |                                  
+   000009               *               (the classic column-store compression) using the          |                                  
+   000010               *               "load-balancing dereference table" of Tiny Pointers       |                                  
+   000011               *               (arXiv:2111.12800, Section 3) as the encode-time          |                                  
+   000012               *               string -> code dictionary.                                |                                  
+   000013               *                                                                         |                                  
+   000014               *   This is the paper's space-efficient DICTIONARY (application #4)       |                                  
+   000015               *   doing real database work.  A distinct string is hashed to a           |                                  
+   000016               *   BUCKET of B slots and stored in a free slot; the dictionary           |                                  
+   000017               *   packs at high load (no 2x safety margin), lossless via a small        |                                  
+   000018               *   linear-probe OVERFLOW backup, with a bounded <= B lookup.             |                                  
+   000019               *                                                                         |                                  
+   000020               *   Pipeline (three flat files, COBOL owns the records):                  |                                  
+   000021               *     COLUMN.DAT  -> [encode] -> ENCODED.DAT  + the dictionary            |                                  
+   000022               *     COLUMN.DAT  +  ENCODED.DAT -> [decode] -> round-trip check          |                                  
+   000023               *                                                                         |                                  
+   000024               *   Reports: DENSITY (how tightly the dictionary packs),                  |                                  
+   000025               *            HANDLE WIDTH (per-row code vs the full string),              |                                  
+   000026               *            and the COLUMN COMPRESSION RATIO.                            |                                  
+   000027               ******************************************************************        |                                  
+   000028                ENVIRONMENT DIVISION.                                                    |                                  
+   000029                INPUT-OUTPUT SECTION.                                                    |                                  
+   000030                FILE-CONTROL.                                                            |                                  
+   000031                    SELECT COLUMN-FILE                                                   |44                                
+   000032                        ASSIGN TO 'data/COLUMN.DAT'                                      |                                  
+   000033                        ORGANIZATION IS LINE SEQUENTIAL                                  |                                  
+   000034                        FILE STATUS IS COL-STATUS.                                       |88                                
+   000035                                                                                         |                                  
+   000036                    SELECT ENCODED-FILE                                                  |48                                
+   000037                        ASSIGN TO 'data/ENCODED.DAT'                                     |                                  
+   000038                        ORGANIZATION IS LINE SEQUENTIAL                                  |                                  
+   000039                        FILE STATUS IS ENC-STATUS.                                       |90                                
+   000040                                                                                         |                                  
+   000041                DATA DIVISION.                                                           |                                  
+   000042                FILE SECTION.                                                            |                                  
+   000043                                                                                         |                                  
+   000044                FD  COLUMN-FILE.                                                         |                                  
+   000045                01  COL-REC.                                                             |                                  
+   000046                    05  COL-STR          PIC X(24).                                      |                                  
+   000047                                                                                         |                                  
+   000048                FD  ENCODED-FILE.                                                        |                                  
+   000049                01  ENC-REC.                                                             |                                  
+   000050                    05  EN-CODE          PIC 9(4).                                       |                                  
+   000051                                                                                         |                                  
+   000052                WORKING-STORAGE SECTION.                                                 |                                  
+   000053                                                                                         |                                  
+   000054               *--- sizing (D distinct values, N rows; dict load = D/(NBKT*B)) --        |                                  
+   000055                01  NBKT                 PIC 9(3) VALUE 35.                              |                                  
+   000056                01  BSLOTS               PIC 9(2) VALUE 16.                              |                                  
+   000057                01  OVF-CAP              PIC 9(3) VALUE 64.                              |                                  
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      DICTENC   Date 06/13/2026  Time 20:07:55   Page     3               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000058                01  N-DISTINCT           PIC 9(4) VALUE 500.                             |                                  
+   000059                01  N-ROWS               PIC 9(6) VALUE 50000.                           |                                  
+   000060                01  STR-BYTES            PIC 9(3) VALUE 24.                              |                                  
+   000061                                                                                         |                                  
+   000062               *--- the dictionary : NBKT buckets x BSLOTS slots ---------------         |                                  
+   000063                01  DICT-STORE.                                                          |                                  
+   000064                    05  D-BUCKET OCCURS 35 TIMES.                                        |                                  
+   000065                        10  D-SLOT OCCURS 16 TIMES.                                      |                                  
+   000066                            15  DS-USED  PIC X.                                          |                                  
+   000067                            15  DS-STR   PIC X(24).                                      |                                  
+   000068                            15  DS-CODE  PIC 9(4).                                       |                                  
+   000069                01  BUCKET-OCC.                                                          |                                  
+   000070                    05  B-OCC OCCURS 35 TIMES PIC 9(2).                                  |                                  
+   000071                                                                                         |                                  
+   000072               *--- the backup table : a small linear-probe overflow region ----         |                                  
+   000073                01  OVERFLOW-STORE.                                                      |                                  
+   000074                    05  O-CELL OCCURS 64 TIMES.                                          |                                  
+   000075                        10  O-USED       PIC X.                                          |                                  
+   000076                        10  O-STR        PIC X(24).                                      |                                  
+   000077                        10  O-CODE       PIC 9(4).                                       |                                  
+   000078                                                                                         |                                  
+   000079               *--- code -> string, for DECODE ---------------------------------         |                                  
+   000080                01  CODE-TABLE.                                                          |                                  
+   000081                    05  CT-STR OCCURS 500 TIMES PIC X(24).                               |                                  
+   000082                                                                                         |                                  
+   000083               *--- the generator's vocabulary of distinct values --------------         |                                  
+   000084                01  VOCAB-TABLE.                                                         |                                  
+   000085                    05  VOCAB OCCURS 500 TIMES PIC X(24).                                |                                  
+   000086                                                                                         |                                  
+   000087               *--- file status ------------------------------------------------         |                                  
+   000088                01  COL-STATUS           PIC XX VALUE SPACES.                            |IMP                               
+   000089                    88  COL-EOF          VALUE '10'.                                     |                                  
+   000090                01  ENC-STATUS           PIC XX VALUE SPACES.                            |IMP                               
+   000091                    88  ENC-EOF          VALUE '10'.                                     |                                  
+   000092                                                                                         |                                  
+   000093               *--- loop / scratch ---------------------------------------------         |                                  
+   000094                01  WS-EOF               PIC X VALUE 'N'.                                |                                  
+   000095                    88  EOF-YES          VALUE 'Y'.                                      |                                  
+   000096                01  WS-I                 PIC 9(9).                                       |                                  
+   000097                01  WS-J                 PIC 9(4).                                       |                                  
+   000098                01  WS-K                 PIC 9(3).                                       |                                  
+   000099                01  WS-S                 PIC 9(6).                                       |                                  
+   000100                01  WS-BKT               PIC 9(4).                                       |                                  
+   000101                01  WS-OH                PIC 9(6).                                       |                                  
+   000102                01  WS-STMP              PIC 9(9).                                       |                                  
+   000103                01  WS-HV                PIC 9(18).                                      |                                  
+   000104                01  WS-T                 PIC 9(18).                                      |                                  
+   000105                01  WS-ORDV              PIC 9(5).                                       |                                  
+   000106                01  WS-HSTR              PIC X(24).                                      |                                  
+   000107                01  WS-CODE              PIC 9(4).                                       |                                  
+   000108                01  WS-FOUND             PIC X VALUE 'N'.                                |                                  
+   000109                    88  FOUND-YES        VALUE 'Y'.                                      |                                  
+   000110                01  WS-VZ                PIC 9(3).                                       |                                  
+   000111                01  WS-VIDX              PIC 9(9).                                       |                                  
+   000112                01  WS-NEXT-CODE         PIC 9(4) VALUE 0.                               |                                  
+   000113                                                                                         |                                  
+   000114               *--- statistics -------------------------------------------------         |                                  
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      DICTENC   Date 06/13/2026  Time 20:07:55   Page     4               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000115                01  WS-PLACED-BUCKET     PIC 9(4) VALUE 0.                               |                                  
+   000116                01  WS-PLACED-OVF        PIC 9(4) VALUE 0.                               |                                  
+   000117                01  WS-HARD-FAIL         PIC 9(4) VALUE 0.                               |                                  
+   000118                01  WS-MAX-OCC           PIC 9(2) VALUE 0.                               |                                  
+   000119                01  WS-ROW-COUNT         PIC 9(8) VALUE 0.                               |                                  
+   000120                01  WS-DEC-COUNT         PIC 9(8) VALUE 0.                               |                                  
+   000121                01  WS-MISMATCH          PIC 9(8) VALUE 0.                               |                                  
+   000122                01  WS-SAMPLE            PIC 9(2) VALUE 0.                               |                                  
+   000123                                                                                         |                                  
+   000124               *--- derived figures for the report -----------------------------         |                                  
+   000125                01  WS-PRIM-CAP          PIC 9(6).                                       |                                  
+   000126                01  WS-LOAD-PCT          PIC ZZ9.99.                                     |                                  
+   000127                01  WS-CODEBITS          PIC 9(2) VALUE 1.                               |                                  
+   000128                01  WS-POW               PIC 9(9) VALUE 2.                               |                                  
+   000129                01  WS-RAW-BYTES         PIC 9(9).                                       |                                  
+   000130                01  WS-ENC-BYTES         PIC 9(9).                                       |                                  
+   000131                01  WS-DICT-BYTES        PIC 9(9).                                       |                                  
+   000132                01  WS-TOTAL-BYTES       PIC 9(9).                                       |                                  
+   000133                01  WS-RATIO             PIC ZZ9.99.                                     |                                  
+   000134                                                                                         |                                  
+   000135               *--- edited fields for display ----------------------------------         |                                  
+   000136                01  WS-ED4               PIC ZZZ9.                                       |                                  
+   000137                01  WS-ED6               PIC ZZZ,ZZ9.                                    |                                  
+   000138                01  WS-ED9               PIC ZZZ,ZZZ,ZZ9.                                |                                  
+   000139                01  WS-ED2               PIC Z9.                                         |                                  
+   000140                                                                                         |                                  
+   000141                PROCEDURE DIVISION.                                                      |                                  
+   000142                                                                                         |                                  
+   000143                0000-MAIN SECTION.                                                       |                                  
+   000144                    PERFORM 1000-GEN-COLUMN                                              |153                               
+   000145                    PERFORM 2000-ENCODE                                                  |181                               
+   000146                    PERFORM 3000-DECODE-VERIFY                                           |285                               
+   000147                    PERFORM 9000-REPORT                                                  |317                               
+   000148                    STOP RUN.                                                            |                                  
+   000149                                                                                         |                                  
+   000150               ******************************************************************        |                                  
+   000151               *  1000 -- generate a low-cardinality string column                       |                                  
+   000152               ******************************************************************        |                                  
+   000153                1000-GEN-COLUMN SECTION.                                                 |                                  
+   000154                1000-GEN.                                                                |                                  
+   000155               *    build the vocabulary of N-DISTINCT distinct values                   |                                  
+   000156                    PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > N-DISTINCT             |96 96 58                          
+   000157      1                 MOVE WS-I TO WS-VZ                                               |96 110                            
+   000158      1                 MOVE SPACES TO VOCAB(WS-I)                                       |IMP 96 85                         
+   000159      1                 STRING 'CATEGORY-' DELIMITED BY SIZE                             |                                  
+   000160      1                        WS-VZ       DELIMITED BY SIZE                             |110                               
+   000161      1                     INTO VOCAB(WS-I)                                             |96 85                             
+   000162                    END-PERFORM                                                          |                                  
+   000163                                                                                         |                                  
+   000164               *    write N-ROWS, each picking a vocabulary entry. A multiplier          |                                  
+   000165               *    coprime to N-DISTINCT (257) cycles through ALL distinct values       |                                  
+   000166               *    (so the dictionary really fills), scrambled rather than 1,2,3.       |                                  
+   000167               *    Uniform repetition is the conservative case; real columns are        |                                  
+   000168               *    skewed (Zipf), which only compresses better.                         |                                  
+   000169                    OPEN OUTPUT COLUMN-FILE                                              |44                                
+   000170                    PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > N-ROWS                 |96 96 59                          
+   000171      1                 COMPUTE WS-T = WS-I * 257                                        |104 96                            
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      DICTENC   Date 06/13/2026  Time 20:07:55   Page     5               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000172      1                 COMPUTE WS-VIDX = FUNCTION MOD(WS-T, N-DISTINCT) + 1             |111 IFN 104 58                    
+   000173      1                 MOVE VOCAB(WS-VIDX) TO COL-STR                                   |111 85 46                         
+   000174      1                 WRITE COL-REC                                                    |45                                
+   000175                    END-PERFORM                                                          |                                  
+   000176                    CLOSE COLUMN-FILE.                                                   |44                                
+   000177                                                                                         |                                  
+   000178               ******************************************************************        |                                  
+   000179               *  2000 -- encode COLUMN.DAT through the tiny-pointer dictionary          |                                  
+   000180               ******************************************************************        |                                  
+   000181                2000-ENCODE SECTION.                                                     |                                  
+   000182                2000-ENC.                                                                |                                  
+   000183                    PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > NBKT                   |96 96 55                          
+   000184      1                 MOVE 0 TO B-OCC(WS-I)                                            |96 70                             
+   000185      1                 PERFORM VARYING WS-J FROM 1 BY 1 UNTIL WS-J > BSLOTS             |97 97 56                          
+   000186      2                     MOVE 'N' TO DS-USED(WS-I, WS-J)                              |96 97 66                          
+   000187      1                 END-PERFORM                                                      |                                  
+   000188                    END-PERFORM                                                          |                                  
+   000189                    PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > OVF-CAP                |96 96 57                          
+   000190      1                 MOVE 'N' TO O-USED(WS-I)                                         |96 75                             
+   000191                    END-PERFORM                                                          |                                  
+   000192                    MOVE 0 TO WS-NEXT-CODE                                               |112                               
+   000193                                                                                         |                                  
+   000194                    OPEN INPUT COLUMN-FILE                                               |44                                
+   000195                    OPEN OUTPUT ENCODED-FILE                                             |48                                
+   000196                    MOVE 'N' TO WS-EOF                                                   |94                                
+   000197                    PERFORM UNTIL EOF-YES                                                |95                                
+   000198      1                 READ COLUMN-FILE                                                 |44                                
+   000199      2                     AT END SET EOF-YES TO TRUE                                   |95                                
+   000200      1                     NOT AT END                                                   |                                  
+   000201      2                         ADD 1 TO WS-ROW-COUNT                                    |119                               
+   000202      2                         MOVE COL-STR TO WS-HSTR                                  |46 106                            
+   000203      2                         PERFORM 2100-DICT-ENCODE                                 |212                               
+   000204      2                         MOVE WS-CODE TO EN-CODE                                  |107 50                            
+   000205      2                         WRITE ENC-REC                                            |49                                
+   000206      1                 END-READ                                                         |                                  
+   000207                    END-PERFORM                                                          |                                  
+   000208                    CLOSE COLUMN-FILE                                                    |44                                
+   000209                    CLOSE ENCODED-FILE.                                                  |48                                
+   000210                                                                                         |                                  
+   000211               *    look the string up; if new, assign the next sequential code          |                                  
+   000212                2100-DICT-ENCODE.                                                        |                                  
+   000213                    PERFORM 2300-HASH                                                    |272                               
+   000214                    MOVE 'N' TO WS-FOUND                                                 |108                               
+   000215                    PERFORM VARYING WS-J FROM 1 BY 1                                     |97                                
+   000216                            UNTIL WS-J > BSLOTS OR FOUND-YES                             |97 56 109                         
+   000217      1                 IF DS-USED(WS-BKT, WS-J) = 'N'                                   |100 97 66                         
+   000218      2                     MOVE 'Y'     TO DS-USED(WS-BKT, WS-J)                        |100 97 66                         
+   000219      2                     MOVE WS-HSTR TO DS-STR(WS-BKT, WS-J)                         |106 100 97 67                     
+   000220      2                     ADD 1 TO WS-NEXT-CODE                                        |112                               
+   000221      2                     MOVE WS-NEXT-CODE TO DS-CODE(WS-BKT, WS-J)                   |112 100 97 68                     
+   000222      2                     MOVE WS-HSTR TO CT-STR(WS-NEXT-CODE)                         |106 112 81                        
+   000223      2                     MOVE WS-NEXT-CODE TO WS-CODE                                 |112 107                           
+   000224      2                     ADD 1 TO B-OCC(WS-BKT)                                       |100 70                            
+   000225      2                     ADD 1 TO WS-PLACED-BUCKET                                    |115                               
+   000226      2                     SET FOUND-YES TO TRUE                                        |109                               
+   000227      1                 ELSE                                                             |                                  
+   000228      2                     IF DS-STR(WS-BKT, WS-J) = WS-HSTR                            |100 97 67 106                     
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      DICTENC   Date 06/13/2026  Time 20:07:55   Page     6               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000229      3                         MOVE DS-CODE(WS-BKT, WS-J) TO WS-CODE                    |100 97 68 107                     
+   000230      3                         SET FOUND-YES TO TRUE                                    |109                               
+   000231      2                     END-IF                                                       |                                  
+   000232      1                 END-IF                                                           |                                  
+   000233                    END-PERFORM                                                          |                                  
+   000234                    IF B-OCC(WS-BKT) > WS-MAX-OCC                                        |100 70 118                        
+   000235      1                 MOVE B-OCC(WS-BKT) TO WS-MAX-OCC                                 |100 70 118                        
+   000236                    END-IF                                                               |                                  
+   000237                    IF NOT FOUND-YES                                                     |109                               
+   000238      1                 PERFORM 2200-DICT-ENCODE-OVF                                     |242                               
+   000239                    END-IF.                                                              |                                  
+   000240                                                                                         |                                  
+   000241               *    backup table : linear probe from a second hash of the key            |                                  
+   000242                2200-DICT-ENCODE-OVF.                                                    |                                  
+   000243                    COMPUTE WS-T  = WS-HV * 40503                                        |104 103                           
+   000244                    COMPUTE WS-OH = FUNCTION MOD(WS-T, OVF-CAP)                          |101 IFN 104 57                    
+   000245                    MOVE 'N' TO WS-FOUND                                                 |108                               
+   000246                    PERFORM VARYING WS-I FROM 0 BY 1                                     |96                                
+   000247                            UNTIL WS-I >= OVF-CAP OR FOUND-YES                           |96 57 109                         
+   000248      1                 COMPUTE WS-STMP = WS-OH + WS-I                                   |102 101 96                        
+   000249      1                 COMPUTE WS-S = FUNCTION MOD(WS-STMP, OVF-CAP) + 1                |99 IFN 102 57                     
+   000250      1                 IF O-USED(WS-S) = 'N'                                            |99 75                             
+   000251      2                     MOVE 'Y'     TO O-USED(WS-S)                                 |99 75                             
+   000252      2                     MOVE WS-HSTR TO O-STR(WS-S)                                  |106 99 76                         
+   000253      2                     ADD 1 TO WS-NEXT-CODE                                        |112                               
+   000254      2                     MOVE WS-NEXT-CODE TO O-CODE(WS-S)                            |112 99 77                         
+   000255      2                     MOVE WS-HSTR TO CT-STR(WS-NEXT-CODE)                         |106 112 81                        
+   000256      2                     MOVE WS-NEXT-CODE TO WS-CODE                                 |112 107                           
+   000257      2                     ADD 1 TO WS-PLACED-OVF                                       |116                               
+   000258      2                     SET FOUND-YES TO TRUE                                        |109                               
+   000259      1                 ELSE                                                             |                                  
+   000260      2                     IF O-STR(WS-S) = WS-HSTR                                     |99 76 106                         
+   000261      3                         MOVE O-CODE(WS-S) TO WS-CODE                             |99 77 107                         
+   000262      3                         SET FOUND-YES TO TRUE                                    |109                               
+   000263      2                     END-IF                                                       |                                  
+   000264      1                 END-IF                                                           |                                  
+   000265                    END-PERFORM                                                          |                                  
+   000266                    IF NOT FOUND-YES                                                     |109                               
+   000267      1                 ADD 1 TO WS-HARD-FAIL                                            |117                               
+   000268      1                 MOVE 0 TO WS-CODE                                                |107                               
+   000269                    END-IF.                                                              |                                  
+   000270                                                                                         |                                  
+   000271               *    rolling hash of WS-HSTR : H = H*31 + ord(ch) mod prime               |                                  
+   000272                2300-HASH.                                                               |                                  
+   000273                    MOVE 0 TO WS-HV                                                      |103                               
+   000274                    PERFORM VARYING WS-K FROM 1 BY 1 UNTIL WS-K > STR-BYTES              |98 98 60                          
+   000275      1                 COMPUTE WS-ORDV = FUNCTION ORD(WS-HSTR(WS-K:1))                  |105 IFN 98 106                    
+   000276      1                 COMPUTE WS-T = WS-HV * 31                                        |104 103                           
+   000277      1                 ADD WS-ORDV TO WS-T                                              |105 104                           
+   000278      1                 COMPUTE WS-HV = FUNCTION MOD(WS-T, 2147483647)                   |103 IFN 104                       
+   000279                    END-PERFORM                                                          |                                  
+   000280                    COMPUTE WS-BKT = FUNCTION MOD(WS-HV, NBKT) + 1.                      |100 IFN 103 55                    
+   000281                                                                                         |                                  
+   000282               ******************************************************************        |                                  
+   000283               *  3000 -- decode ENCODED.DAT and verify against COLUMN.DAT               |                                  
+   000284               ******************************************************************        |                                  
+   000285                3000-DECODE-VERIFY SECTION.                                              |                                  
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      DICTENC   Date 06/13/2026  Time 20:07:55   Page     7               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000286                3000-DEC.                                                                |                                  
+   000287                    OPEN INPUT COLUMN-FILE                                               |44                                
+   000288                    OPEN INPUT ENCODED-FILE                                              |48                                
+   000289                    MOVE 'N' TO WS-EOF                                                   |94                                
+   000290                    PERFORM UNTIL EOF-YES                                                |95                                
+   000291      1                 READ COLUMN-FILE                                                 |44                                
+   000292      2                     AT END SET EOF-YES TO TRUE                                   |95                                
+   000293      1                     NOT AT END                                                   |                                  
+   000294      2                         READ ENCODED-FILE                                        |48                                
+   000295      3                             AT END SET EOF-YES TO TRUE                           |95                                
+   000296      2                             NOT AT END                                           |                                  
+   000297      3                                 ADD 1 TO WS-DEC-COUNT                            |120                               
+   000298      3                                 IF CT-STR(EN-CODE) NOT = COL-STR                 |50 81 46                          
+   000299      4                                     ADD 1 TO WS-MISMATCH                         |121                               
+   000300      3                                 END-IF                                           |                                  
+   000301      3                                 PERFORM 3100-SAMPLE                              |308                               
+   000302      2                         END-READ                                                 |                                  
+   000303      1                 END-READ                                                         |                                  
+   000304                    END-PERFORM                                                          |                                  
+   000305                    CLOSE COLUMN-FILE                                                    |44                                
+   000306                    CLOSE ENCODED-FILE.                                                  |48                                
+   000307                                                                                         |                                  
+   000308                3100-SAMPLE.                                                             |                                  
+   000309                    IF WS-SAMPLE < 5                                                     |122                               
+   000310      1                 ADD 1 TO WS-SAMPLE                                               |122                               
+   000311      1                 DISPLAY '   "' COL-STR '" -> code ' EN-CODE                      |46 50                             
+   000312                    END-IF.                                                              |                                  
+   000313                                                                                         |                                  
+   000314               ******************************************************************        |                                  
+   000315               *  9000 -- the report : density, handle width, compression                |                                  
+   000316               ******************************************************************        |                                  
+   000317                9000-REPORT SECTION.                                                     |                                  
+   000318                9000-RPT.                                                                |                                  
+   000319                    COMPUTE WS-PRIM-CAP = NBKT * BSLOTS                                  |125 55 56                         
+   000320                    COMPUTE WS-LOAD-PCT =                                                |126                               
+   000321                            100.0 * WS-PLACED-BUCKET / WS-PRIM-CAP                       |115 125                           
+   000322                                                                                         |                                  
+   000323               *    code width in bits = smallest c with 2^c >= distinct values          |                                  
+   000324                    MOVE 1 TO WS-CODEBITS                                                |127                               
+   000325                    MOVE 2 TO WS-POW                                                     |128                               
+   000326                    PERFORM UNTIL WS-POW >= WS-NEXT-CODE                                 |128 112                           
+   000327      1                 COMPUTE WS-POW = WS-POW * 2                                      |128 128                           
+   000328      1                 ADD 1 TO WS-CODEBITS                                             |127                               
+   000329                    END-PERFORM                                                          |                                  
+   000330                                                                                         |                                  
+   000331                    COMPUTE WS-RAW-BYTES  = WS-ROW-COUNT * STR-BYTES                     |129 119 60                        
+   000332                    COMPUTE WS-ENC-BYTES  =                                              |130                               
+   000333                            (WS-ROW-COUNT * WS-CODEBITS + 7) / 8                         |119 127                           
+   000334                    COMPUTE WS-DICT-BYTES = WS-NEXT-CODE * STR-BYTES                     |131 112 60                        
+   000335                    COMPUTE WS-TOTAL-BYTES = WS-ENC-BYTES + WS-DICT-BYTES                |132 130 131                       
+   000336                    COMPUTE WS-RATIO ROUNDED =                                           |133                               
+   000337                            WS-RAW-BYTES / WS-TOTAL-BYTES                                |129 132                           
+   000338                                                                                         |                                  
+   000339                    DISPLAY ' '                                                          |                                  
+   000340                    DISPLAY '==============================================='            |                                  
+   000341                    DISPLAY '  DICTENC -- tiny-pointer dictionary encoder'               |                                  
+   000342                    DISPLAY '==============================================='            |                                  
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      DICTENC   Date 06/13/2026  Time 20:07:55   Page     8               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000343                    DISPLAY ' '                                                          |                                  
+   000344                    DISPLAY '  ROUND-TRIP (decode == original):'                         |                                  
+   000345                    MOVE WS-DEC-COUNT TO WS-ED9                                          |120 138                           
+   000346                    DISPLAY '    rows decoded        : ' WS-ED9                          |138                               
+   000347                    MOVE WS-MISMATCH TO WS-ED9                                           |121 138                           
+   000348                    DISPLAY '    mismatches          : ' WS-ED9                          |138                               
+   000349                            '   <- 0 = lossless PASS'                                    |                                  
+   000350                    DISPLAY ' '                                                          |                                  
+   000351                    DISPLAY '  DENSITY (the encode-time dictionary):'                    |                                  
+   000352                    MOVE WS-NEXT-CODE TO WS-ED4                                          |112 136                           
+   000353                    DISPLAY '    distinct values     : ' WS-ED4                          |136                               
+   000354                    MOVE WS-PRIM-CAP TO WS-ED4                                           |125 136                           
+   000355                    DISPLAY '    primary capacity    : ' WS-ED4                          |136                               
+   000356                            '   (' NBKT ' buckets x ' BSLOTS ')'                         |55 56                             
+   000357                    MOVE WS-PLACED-BUCKET TO WS-ED4                                      |115 136                           
+   000358                    DISPLAY '    placed in buckets   : ' WS-ED4                          |136                               
+   000359                            '   load ' WS-LOAD-PCT ' %'                                  |126                               
+   000360                    MOVE WS-PLACED-OVF TO WS-ED4                                         |116 136                           
+   000361                    DISPLAY '    spilled to backup   : ' WS-ED4                          |136                               
+   000362                    MOVE WS-HARD-FAIL TO WS-ED4                                          |117 136                           
+   000363                    DISPLAY '    lost (unplaceable)  : ' WS-ED4                          |136                               
+   000364                            '   <- lossless'                                             |                                  
+   000365                    MOVE WS-MAX-OCC TO WS-ED2                                            |118 139                           
+   000366                    DISPLAY '    max bucket fill     : ' WS-ED2 ' / ' BSLOTS             |139 56                            
+   000367                            '   (bounded probe, no tail)'                                |                                  
+   000368                    DISPLAY ' '                                                          |                                  
+   000369                    DISPLAY '  HANDLE WIDTH (per row, code vs the string):'              |                                  
+   000370                    MOVE WS-CODEBITS TO WS-ED2                                           |127 139                           
+   000371                    DISPLAY '    full string         : ' STR-BYTES                       |60                                
+   000372                            ' bytes (192 bits)'                                          |                                  
+   000373                    DISPLAY '    dictionary code     : ' WS-ED2                          |139                               
+   000374                            ' bits   <- the tiny pointer'                                |                                  
+   000375                    DISPLAY '    dict string->slot   :  4 bits (log2 B)'                 |                                  
+   000376                            ' vs a 32-bit pointer'                                       |                                  
+   000377                    DISPLAY ' '                                                          |                                  
+   000378                    DISPLAY '  COLUMN COMPRESSION:'                                      |                                  
+   000379                    MOVE WS-RAW-BYTES TO WS-ED9                                          |129 138                           
+   000380                    DISPLAY '    raw column          : ' WS-ED9 ' bytes'                 |138                               
+   000381                    MOVE WS-ENC-BYTES TO WS-ED9                                          |130 138                           
+   000382                    DISPLAY '    encoded codes       : ' WS-ED9 ' bytes'                 |138                               
+   000383                    MOVE WS-DICT-BYTES TO WS-ED9                                         |131 138                           
+   000384                    DISPLAY '    + dictionary        : ' WS-ED9 ' bytes'                 |138                               
+   000385                    MOVE WS-TOTAL-BYTES TO WS-ED9                                        |132 138                           
+   000386                    DISPLAY '    = total             : ' WS-ED9 ' bytes'                 |138                               
+   000387                            '   (' WS-RATIO 'x smaller)'                                 |133                               
+   000388                    DISPLAY ' '                                                          |                                  
+   000389                    DISPLAY '  Every row stores the code (the dictionary''s'             |                                  
+   000390                    DISPLAY '  tiny pointer), not the string.  The dictionary'           |                                  
+   000391                    DISPLAY '  packs at the load shown above, bounded lookup.'           |                                  
+   000392                    DISPLAY '==============================================='.           |                                  
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      DICTENC   Date 06/13/2026  Time 20:07:55   Page     9               
+0An "M" preceding a data-name reference indicates that the data-name is modified by this reference.
+  
+  Defined   Cross-reference of data names   References                                                                               
+  
+       70   B-OCC. . . . . . . . . . . . .  M184 M224 234 235                                                                                                                                    
+       56   BSLOTS . . . . . . . . . . . .  185 216 319 356 366                                                                                                                                  
+       69   BUCKET-OCC                                                                                                                                                                           
+       80   CODE-TABLE                                                                                                                                                                           
+       89   COL-EOF                                                                                                                                                                              
+       45   COL-REC. . . . . . . . . . . .  174                                                                                                                                                  
+       88   COL-STATUS . . . . . . . . . .  34                                                                                                                                                   
+       46   COL-STR. . . . . . . . . . . .  M173 202 298 311                                                                                                                                     
+       44   COLUMN-FILE. . . . . . . . . .  31 169 176 194 198 208 287 291 305                                                                                                                   
+       81   CT-STR . . . . . . . . . . . .  M222 M255 298                                                                                                                                        
+       64   D-BUCKET                                                                                                                                                                             
+       65   D-SLOT                                                                                                                                                                               
+       63   DICT-STORE                                                                                                                                                                           
+       68   DS-CODE. . . . . . . . . . . .  M221 229                                                                                                                                             
+       67   DS-STR . . . . . . . . . . . .  M219 228                                                                                                                                             
+       66   DS-USED. . . . . . . . . . . .  M186 217 M218                                                                                                                                        
+       50   EN-CODE. . . . . . . . . . . .  M204 298 311                                                                                                                                         
+       91   ENC-EOF                                                                                                                                                                              
+       49   ENC-REC. . . . . . . . . . . .  205                                                                                                                                                  
+       90   ENC-STATUS . . . . . . . . . .  39                                                                                                                                                   
+       48   ENCODED-FILE . . . . . . . . .  36 195 209 288 294 306                                                                                                                               
+       95   EOF-YES. . . . . . . . . . . .  197 M199 290 M292 M295                                                                                                                               
+      109   FOUND-YES. . . . . . . . . . .  216 M226 M230 237 247 M258 M262 266                                                                                                                  
+       58   N-DISTINCT . . . . . . . . . .  156 172                                                                                                                                              
+       59   N-ROWS . . . . . . . . . . . .  170                                                                                                                                                  
+       55   NBKT . . . . . . . . . . . . .  183 280 319 356                                                                                                                                      
+       74   O-CELL                                                                                                                                                                               
+       77   O-CODE . . . . . . . . . . . .  M254 261                                                                                                                                             
+       76   O-STR. . . . . . . . . . . . .  M252 260                                                                                                                                             
+       75   O-USED . . . . . . . . . . . .  M190 250 M251                                                                                                                                        
+       73   OVERFLOW-STORE                                                                                                                                                                       
+       57   OVF-CAP. . . . . . . . . . . .  189 244 247 249                                                                                                                                      
+       60   STR-BYTES. . . . . . . . . . .  274 331 334 371                                                                                                                                      
+       85   VOCAB. . . . . . . . . . . . .  M158 M161 173                                                                                                                                        
+       84   VOCAB-TABLE                                                                                                                                                                          
+      100   WS-BKT . . . . . . . . . . . .  217 218 219 221 224 228 229 234 235 M280                                                                                                             
+      107   WS-CODE. . . . . . . . . . . .  204 M223 M229 M256 M261 M268                                                                                                                         
+      127   WS-CODEBITS. . . . . . . . . .  M324 M328 333 370                                                                                                                                    
+      120   WS-DEC-COUNT . . . . . . . . .  M297 345                                                                                                                                             
+      131   WS-DICT-BYTES. . . . . . . . .  M334 335 383                                                                                                                                         
+      139   WS-ED2 . . . . . . . . . . . .  M365 366 M370 373                                                                                                                                    
+      136   WS-ED4 . . . . . . . . . . . .  M352 353 M354 355 M357 358 M360 361 M362 363                                                                                                         
+      137   WS-ED6                                                                                                                                                                               
+      138   WS-ED9 . . . . . . . . . . . .  M345 346 M347 348 M379 380 M381 382 M383 384 M385 386                                                                                                
+      130   WS-ENC-BYTES . . . . . . . . .  M332 335 381                                                                                                                                         
+       94   WS-EOF . . . . . . . . . . . .  M196 M289                                                                                                                                            
+      108   WS-FOUND . . . . . . . . . . .  M214 M245                                                                                                                                            
+      117   WS-HARD-FAIL . . . . . . . . .  M267 362                                                                                                                                             
+      106   WS-HSTR. . . . . . . . . . . .  M202 219 222 228 252 255 260 275                                                                                                                     
+      103   WS-HV. . . . . . . . . . . . .  243 M273 276 M278 280                                                                                                                                
+       96   WS-I . . . . . . . . . . . . .  M156 156 157 158 161 M170 170 171 M183 183 184 186 M189 189 190 M246 247 248                                                                         
+       97   WS-J . . . . . . . . . . . . .  M185 185 186 M215 216 217 218 219 221 228 229                                                                                                        
+       98   WS-K . . . . . . . . . . . . .  M274 274 275                                                                                                                                         
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      DICTENC   Date 06/13/2026  Time 20:07:55   Page    10               
+0 Defined   Cross-reference of data names   References                                                                               
+  
+      126   WS-LOAD-PCT. . . . . . . . . .  M320 359                                                                                                                                             
+      118   WS-MAX-OCC . . . . . . . . . .  234 M235 365                                                                                                                                         
+      121   WS-MISMATCH. . . . . . . . . .  M299 347                                                                                                                                             
+      112   WS-NEXT-CODE . . . . . . . . .  M192 M220 221 222 223 M253 254 255 256 326 334 352                                                                                                   
+      101   WS-OH. . . . . . . . . . . . .  M244 248                                                                                                                                             
+      105   WS-ORDV. . . . . . . . . . . .  M275 277                                                                                                                                             
+      115   WS-PLACED-BUCKET . . . . . . .  M225 321 357                                                                                                                                         
+      116   WS-PLACED-OVF. . . . . . . . .  M257 360                                                                                                                                             
+      128   WS-POW . . . . . . . . . . . .  M325 326 M327 327                                                                                                                                    
+      125   WS-PRIM-CAP. . . . . . . . . .  M319 321 354                                                                                                                                         
+      133   WS-RATIO . . . . . . . . . . .  M336 387                                                                                                                                             
+      129   WS-RAW-BYTES . . . . . . . . .  M331 337 379                                                                                                                                         
+      119   WS-ROW-COUNT . . . . . . . . .  M201 331 333                                                                                                                                         
+       99   WS-S . . . . . . . . . . . . .  M249 250 251 252 254 260 261                                                                                                                         
+      122   WS-SAMPLE. . . . . . . . . . .  309 M310                                                                                                                                             
+      102   WS-STMP. . . . . . . . . . . .  M248 249                                                                                                                                             
+      104   WS-T . . . . . . . . . . . . .  M171 172 M243 244 M276 M277 278                                                                                                                      
+      132   WS-TOTAL-BYTES . . . . . . . .  M335 337 385                                                                                                                                         
+      111   WS-VIDX. . . . . . . . . . . .  M172 173                                                                                                                                             
+      110   WS-VZ. . . . . . . . . . . . .  M157 160                                                                                                                                             
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      DICTENC   Date 06/13/2026  Time 20:07:55   Page    11               
+0Context usage is indicated by the letter preceding a procedure-name reference.
+ These letters and their meanings are:
+     A = ALTER (procedure-name)
+     D = GO TO (procedure-name) DEPENDING ON
+     E = End of range of (PERFORM) through (procedure-name)
+     G = GO TO (procedure-name)
+     P = PERFORM (procedure-name)
+     T = (ALTER) TO PROCEED TO (procedure-name)
+     U = USE FOR DEBUGGING (procedure-name)
+  
+  Defined   Cross-reference of procedures   References                                                                               
+  
+      143   0000-MAIN                                                                                                                                                                            
+      154   1000-GEN                                                                                                                                                                             
+      153   1000-GEN-COLUMN. . . . . . . .  P144                                                                                                                                                 
+      182   2000-ENC                                                                                                                                                                             
+      181   2000-ENCODE. . . . . . . . . .  P145                                                                                                                                                 
+      212   2100-DICT-ENCODE . . . . . . .  P203                                                                                                                                                 
+      242   2200-DICT-ENCODE-OVF . . . . .  P238                                                                                                                                                 
+      272   2300-HASH. . . . . . . . . . .  P213                                                                                                                                                 
+      286   3000-DEC                                                                                                                                                                             
+      285   3000-DECODE-VERIFY . . . . . .  P146                                                                                                                                                 
+      308   3100-SAMPLE. . . . . . . . . .  P301                                                                                                                                                 
+      317   9000-REPORT. . . . . . . . . .  P147                                                                                                                                                 
+      318   9000-RPT                                                                                                                                                                             
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      DICTENC   Date 06/13/2026  Time 20:07:55   Page    12               
+0 Defined   Cross-reference of programs     References                                                                               
+  
+        2   DICTENC                                                                                                                                                                              
+-* Statistics for COBOL program DICTENC:
+ *    Source records = 392
+ *    Data Division statements = 71
+ *    Procedure Division statements = 158
+0Locale = en_GB.UTF-8
+0End of compilation 1,  program DICTENC,  no statements flagged.
+0Return code 0

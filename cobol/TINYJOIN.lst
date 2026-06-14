@@ -1,0 +1,584 @@
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0                Date 06/13/2026  Time 19:50:20   Page     1               
+0Invocation parameters:
+ ADDR(64)
+0Options in effect:
+  NOADATA                                                                                                                            
+    ADDR(64)                                                                                                                         
+    QUOTE                                                                                                                            
+    ARITH(COMPAT)                                                                                                                    
+    BINARY(NATIVE)                                                                                                                   
+    CALLINT(NODESCRIPTOR)                                                                                                            
+    CHAR(NATIVE)                                                                                                                     
+  NOCICS                                                                                                                             
+    COLLSEQ(BINARY)                                                                                                                  
+  NOCOMPILE(S)                                                                                                                       
+  NOCURRENCY                                                                                                                         
+    DATETIME(1900,40)                                                                                                                
+  NODATEPROC                                                                                                                         
+  NODEFINE                                                                                                                           
+  NODIAGTRUNC                                                                                                                        
+  NODYNAM                                                                                                                            
+  NOEXIT                                                                                                                             
+    FLAG(I,I)                                                                                                                        
+  NOFLAGSTD                                                                                                                          
+    FLOAT(NATIVE)                                                                                                                    
+    LINECOUNT(60)                                                                                                                    
+  NOLIST                                                                                                                             
+    LSTFILE(LOCALE)                                                                                                                  
+  NOMAP                                                                                                                              
+  NOMDECK                                                                                                                            
+    NCOLLSEQ(BINARY)                                                                                                                 
+    NSYMBOL(NATIONAL)                                                                                                                
+  NONUMBER                                                                                                                           
+  NOOPTIMIZE                                                                                                                         
+    PGMNAME(LONGUPPER)                                                                                                               
+    SEPOBJ                                                                                                                           
+    SEQUENCE                                                                                                                         
+  NOSOSI                                                                                                                             
+    SOURCE                                                                                                                           
+    SPACE(1)                                                                                                                         
+    SPILL(512)                                                                                                                       
+  NOSQL                                                                                                                              
+    SRCFORMAT(COMPAT)                                                                                                                
+  NOSSRANGE                                                                                                                          
+    TERM                                                                                                                             
+  NOTEST                                                                                                                             
+  NOTHREAD                                                                                                                           
+    TRUNC(STD)                                                                                                                       
+    UTF16(NATIVE)                                                                                                                    
+  NOVBREF                                                                                                                            
+  NOWSCLEAR                                                                                                                          
+    XREF(FULL)                                                                                                                       
+    YEARWINDOW(1900)                                                                                                                 
+    ZWB                                                                                                                              
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      TINYJOIN  Date 06/13/2026  Time 19:50:20   Page     2               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000001                IDENTIFICATION DIVISION.                                                 |                                  
+   000002                PROGRAM-ID.    TINYJOIN.                                                 |                                  
+   000003                AUTHOR.        FRASER.                                                   |                                  
+   000004               ******************************************************************        |                                  
+   000005               * Program     : TINYJOIN.CBL                                              |                                  
+   000006               * Application : Tiny Pointers lab -- COBOL hash-join demo                 |                                  
+   000007               * Type        : Batch COBOL Program                                       |                                  
+   000008               * Function    : A relational JOIN of two flat files using the             |                                  
+   000009               *               "load-balancing dereference table" of                     |                                  
+   000010               *               Tiny Pointers (arXiv:2111.12800, Section 3).              |                                  
+   000011               *                                                                         |                                  
+   000012               *   Tables : CUSTOMER.DAT (inner / build) joined to                       |                                  
+   000013               *            ORDERS.DAT   (outer / probe) on customer id.                 |                                  
+   000014               *                                                                         |                                  
+   000015               *   The dereference table hashes a key to a BUCKET of B slots and         |                                  
+   000016               *   stores it in any free slot j.  The "tiny pointer" is just j --        |                                  
+   000017               *   ceil(log2 B) bits -- not a full record pointer.  A few buckets        |                                  
+   000018               *   fill up (the paper's delta-fraction); those spill to a small          |                                  
+   000019               *   linear-probe OVERFLOW region (the paper's backup table) so the        |                                  
+   000020               *   join is LOSSLESS.  DEREFERENCE = recompute bucket from the key,       |                                  
+   000021               *   scan <= B slots: a bounded, tail-free probe even at high load.        |                                  
+   000022               *                                                                         |                                  
+   000023               *   This is a CPU, single-thread teaching demo: the point is the          |                                  
+   000024               *   STRUCTURE, the DENSITY it reaches, and the tiny HANDLE width --       |                                  
+   000025               *   not raw speed (that is the CUDA Fortran engine next door).            |                                  
+   000026               ******************************************************************        |                                  
+   000027                ENVIRONMENT DIVISION.                                                    |                                  
+   000028                INPUT-OUTPUT SECTION.                                                    |                                  
+   000029                FILE-CONTROL.                                                            |                                  
+   000030                    SELECT CUSTOMER-FILE                                                 |48                                
+   000031                        ASSIGN TO 'data/CUSTOMER.DAT'                                    |                                  
+   000032                        ORGANIZATION IS LINE SEQUENTIAL                                  |                                  
+   000033                        FILE STATUS IS CUST-STATUS.                                      |97                                
+   000034                                                                                         |                                  
+   000035                    SELECT ORDERS-FILE                                                   |53                                
+   000036                        ASSIGN TO 'data/ORDERS.DAT'                                      |                                  
+   000037                        ORGANIZATION IS LINE SEQUENTIAL                                  |                                  
+   000038                        FILE STATUS IS ORD-STATUS.                                       |100                               
+   000039                                                                                         |                                  
+   000040                    SELECT JOINED-FILE                                                   |59                                
+   000041                        ASSIGN TO 'data/JOINED.DAT'                                      |                                  
+   000042                        ORGANIZATION IS LINE SEQUENTIAL                                  |                                  
+   000043                        FILE STATUS IS JN-STATUS.                                        |103                               
+   000044                                                                                         |                                  
+   000045                DATA DIVISION.                                                           |                                  
+   000046                FILE SECTION.                                                            |                                  
+   000047                                                                                         |                                  
+   000048                FD  CUSTOMER-FILE.                                                       |                                  
+   000049                01  CUST-REC.                                                            |                                  
+   000050                    05  CR-ID            PIC 9(6).                                       |                                  
+   000051                    05  CR-NAME          PIC X(20).                                      |                                  
+   000052                                                                                         |                                  
+   000053                FD  ORDERS-FILE.                                                         |                                  
+   000054                01  ORD-REC.                                                             |                                  
+   000055                    05  OR-ID            PIC 9(8).                                       |                                  
+   000056                    05  OR-CID           PIC 9(6).                                       |                                  
+   000057                    05  OR-AMT           PIC 9(9).                                       |                                  
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      TINYJOIN  Date 06/13/2026  Time 19:50:20   Page     3               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000058                                                                                         |                                  
+   000059                FD  JOINED-FILE.                                                         |                                  
+   000060                01  JN-REC.                                                              |                                  
+   000061                    05  JN-OID           PIC 9(8).                                       |                                  
+   000062                    05  FILLER           PIC X(1).                                       |                                  
+   000063                    05  JN-CID           PIC 9(6).                                       |                                  
+   000064                    05  FILLER           PIC X(1).                                       |                                  
+   000065                    05  JN-NAME          PIC X(20).                                      |                                  
+   000066                    05  FILLER           PIC X(1).                                       |                                  
+   000067                    05  JN-AMT           PIC 9(9).                                       |                                  
+   000068                                                                                         |                                  
+   000069                WORKING-STORAGE SECTION.                                                 |                                  
+   000070                                                                                         |                                  
+   000071               *--- sizing (primary load = N-CUST / (NBKT*BSLOTS) ) -------------        |                                  
+   000072               *    plain data items: IBM COBOL 1.2.0 has no level-78 constants.         |                                  
+   000073               *    OCCURS below uses the matching integer literals (640 / 8 / 768).     |                                  
+   000074                01  NBKT                 PIC 9(3) VALUE 640.                             |                                  
+   000075                01  BSLOTS               PIC 9    VALUE 8.                               |                                  
+   000076                01  OVF-CAP              PIC 9(3) VALUE 768.                             |                                  
+   000077                01  N-CUST               PIC 9(4) VALUE 4608.                            |                                  
+   000078                01  N-ORDER              PIC 9(5) VALUE 18432.                           |                                  
+   000079                01  CUST-BASE            PIC 9(6) VALUE 100000.                          |                                  
+   000080                                                                                         |                                  
+   000081               *--- the dereference table : NBKT buckets x BSLOTS slots ---------        |                                  
+   000082                01  PRIMARY-STORE.                                                       |                                  
+   000083                    05  P-BUCKET OCCURS 640 TIMES.                                       |                                  
+   000084                        10  P-SLOT OCCURS 8 TIMES.                                       |                                  
+   000085                            15  P-KEY    PIC 9(6).                                       |                                  
+   000086                            15  P-NAME   PIC X(20).                                      |                                  
+   000087                01  BUCKET-OCC.                                                          |                                  
+   000088                    05  B-OCC OCCURS 640 TIMES PIC 9(2).                                 |                                  
+   000089                                                                                         |                                  
+   000090               *--- the backup table : a small linear-probe overflow region ----         |                                  
+   000091                01  OVERFLOW-STORE.                                                      |                                  
+   000092                    05  O-CELL OCCURS 768 TIMES.                                         |                                  
+   000093                        10  O-KEY        PIC 9(6).                                       |                                  
+   000094                        10  O-NAME       PIC X(20).                                      |                                  
+   000095                                                                                         |                                  
+   000096               *--- file status ------------------------------------------------         |                                  
+   000097                01  CUST-STATUS          PIC XX VALUE SPACES.                            |IMP                               
+   000098                    88  CUST-OK          VALUE '00'.                                     |                                  
+   000099                    88  CUST-EOF         VALUE '10'.                                     |                                  
+   000100                01  ORD-STATUS           PIC XX VALUE SPACES.                            |IMP                               
+   000101                    88  ORD-OK           VALUE '00'.                                     |                                  
+   000102                    88  ORD-EOF          VALUE '10'.                                     |                                  
+   000103                01  JN-STATUS            PIC XX VALUE SPACES.                            |IMP                               
+   000104                                                                                         |                                  
+   000105               *--- loop / scratch ---------------------------------------------         |                                  
+   000106                01  WS-EOF               PIC X VALUE 'N'.                                |                                  
+   000107                    88  EOF-YES          VALUE 'Y'.                                      |                                  
+   000108                01  WS-I                 PIC 9(9).                                       |                                  
+   000109                01  WS-J                 PIC 9(4).                                       |                                  
+   000110                01  WS-S                 PIC 9(6).                                       |                                  
+   000111                01  WS-BKT               PIC 9(4).                                       |                                  
+   000112                01  WS-OH                PIC 9(6).                                       |                                  
+   000113                01  WS-STMP              PIC 9(9).                                       |                                  
+   000114                01  WS-HV                PIC 9(18).                                      |                                  
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      TINYJOIN  Date 06/13/2026  Time 19:50:20   Page     4               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000115                01  WS-PLACED            PIC X VALUE 'N'.                                |                                  
+   000116                    88  PLACED-YES       VALUE 'Y'.                                      |                                  
+   000117                01  WS-FOUND             PIC X VALUE 'N'.                                |                                  
+   000118                    88  FOUND-YES        VALUE 'Y'.                                      |                                  
+   000119                01  WS-STOP              PIC X VALUE 'N'.                                |                                  
+   000120                    88  STOP-YES         VALUE 'Y'.                                      |                                  
+   000121                01  WS-RESULT-NAME       PIC X(20).                                      |                                  
+   000122                01  WS-IDX-Z             PIC 9(6).                                       |                                  
+   000123                01  WS-SEED              PIC 9(18) VALUE 12345.                          |                                  
+   000124                01  WS-CIDX              PIC 9(9).                                       |                                  
+   000125                                                                                         |                                  
+   000126               *--- statistics -------------------------------------------------         |                                  
+   000127                01  WS-CUST-COUNT        PIC 9(6)  VALUE 0.                              |                                  
+   000128                01  WS-PLACED-BUCKET     PIC 9(6)  VALUE 0.                              |                                  
+   000129                01  WS-PLACED-OVF        PIC 9(6)  VALUE 0.                              |                                  
+   000130                01  WS-HARD-FAIL         PIC 9(6)  VALUE 0.                              |                                  
+   000131                01  WS-MAX-OCC           PIC 9(2)  VALUE 0.                              |                                  
+   000132                01  WS-ORDER-COUNT       PIC 9(8)  VALUE 0.                              |                                  
+   000133                01  WS-MATCH-COUNT       PIC 9(8)  VALUE 0.                              |                                  
+   000134                                                                                         |                                  
+   000135               *--- derived figures for the report -----------------------------         |                                  
+   000136                01  WS-PRIM-CAP          PIC 9(7).                                       |                                  
+   000137                01  WS-LOAD-PCT          PIC ZZ9.99.                                     |                                  
+   000138                01  WS-OVF-PCT           PIC ZZ9.99.                                     |                                  
+   000139                01  WS-TINY-BITS-TOT     PIC 9(9).                                       |                                  
+   000140                01  WS-TINY-BYTES        PIC 9(7).                                       |                                  
+   000141                01  WS-FULL-BYTES        PIC 9(7).                                       |                                  
+   000142                01  WS-RATIO             PIC ZZ9.99.                                     |                                  
+   000143                01  WS-BLEND-BITS        PIC Z9.99.                                      |                                  
+   000144                01  WS-MATCH-PCT         PIC ZZ9.99.                                     |                                  
+   000145                01  WS-SAMPLE            PIC 9(2) VALUE 0.                               |                                  
+   000146                                                                                         |                                  
+   000147               *--- edited fields for display ----------------------------------         |                                  
+   000148                01  WS-ED6               PIC ZZZ,ZZ9.                                    |                                  
+   000149                01  WS-ED7               PIC Z,ZZZ,ZZ9.                                  |                                  
+   000150                01  WS-ED2               PIC Z9.                                         |                                  
+   000151                                                                                         |                                  
+   000152                PROCEDURE DIVISION.                                                      |                                  
+   000153                                                                                         |                                  
+   000154                0000-MAIN SECTION.                                                       |                                  
+   000155                    PERFORM 1000-GEN-DATA                                                |164                               
+   000156                    PERFORM 2000-BUILD-TABLE                                             |193                               
+   000157                    PERFORM 3000-JOIN                                                    |262                               
+   000158                    PERFORM 9000-REPORT                                                  |330                               
+   000159                    STOP RUN.                                                            |                                  
+   000160                                                                                         |                                  
+   000161               ******************************************************************        |                                  
+   000162               *  1000 -- generate the two relational tables as flat files               |                                  
+   000163               ******************************************************************        |                                  
+   000164                1000-GEN-DATA SECTION.                                                   |                                  
+   000165                1000-GEN.                                                                |                                  
+   000166                    OPEN OUTPUT CUSTOMER-FILE                                            |48                                
+   000167                    PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > N-CUST                 |108 108 77                        
+   000168      1                 COMPUTE CR-ID = CUST-BASE + WS-I                                 |50 79 108                         
+   000169      1                 MOVE WS-I TO WS-IDX-Z                                            |108 122                           
+   000170      1                 MOVE SPACES TO CR-NAME                                           |IMP 51                            
+   000171      1                 STRING 'CUSTOMER-' DELIMITED BY SIZE                             |                                  
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      TINYJOIN  Date 06/13/2026  Time 19:50:20   Page     5               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000172      1                        WS-IDX-Z    DELIMITED BY SIZE                             |122                               
+   000173      1                     INTO CR-NAME                                                 |51                                
+   000174      1                 WRITE CUST-REC                                                   |49                                
+   000175                    END-PERFORM                                                          |                                  
+   000176                    CLOSE CUSTOMER-FILE                                                  |48                                
+   000177                                                                                         |                                  
+   000178               *    orders reference a random existing customer (Park-Miller LCG)        |                                  
+   000179                    OPEN OUTPUT ORDERS-FILE                                              |53                                
+   000180                    PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > N-ORDER                |108 108 78                        
+   000181      1                 COMPUTE WS-SEED = FUNCTION MOD(WS-SEED * 16807, 2147483647)      |123 IFN 123                       
+   000182      1                 COMPUTE WS-CIDX = FUNCTION MOD(WS-SEED, N-CUST) + 1              |124 IFN 123 77                    
+   000183      1                 COMPUTE OR-ID  = 10000000 + WS-I                                 |55 108                            
+   000184      1                 COMPUTE OR-CID = CUST-BASE + WS-CIDX                             |56 79 124                         
+   000185      1                 COMPUTE OR-AMT = FUNCTION MOD(WS-SEED, 100000000)                |57 IFN 123                        
+   000186      1                 WRITE ORD-REC                                                    |54                                
+   000187                    END-PERFORM                                                          |                                  
+   000188                    CLOSE ORDERS-FILE.                                                   |53                                
+   000189                                                                                         |                                  
+   000190               ******************************************************************        |                                  
+   000191               *  2000 -- build the dereference table from CUSTOMER.DAT                  |                                  
+   000192               ******************************************************************        |                                  
+   000193                2000-BUILD-TABLE SECTION.                                                |                                  
+   000194                2000-BUILD.                                                              |                                  
+   000195               *    clear the arenas (0 key = empty slot)                                |                                  
+   000196                    PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > NBKT                   |108 108 74                        
+   000197      1                 MOVE 0 TO B-OCC(WS-I)                                            |108 88                            
+   000198      1                 PERFORM VARYING WS-J FROM 1 BY 1 UNTIL WS-J > BSLOTS             |109 109 75                        
+   000199      2                     MOVE 0 TO P-KEY(WS-I, WS-J)                                  |108 109 85                        
+   000200      1                 END-PERFORM                                                      |                                  
+   000201                    END-PERFORM                                                          |                                  
+   000202                    PERFORM VARYING WS-I FROM 1 BY 1 UNTIL WS-I > OVF-CAP                |108 108 76                        
+   000203      1                 MOVE 0 TO O-KEY(WS-I)                                            |108 93                            
+   000204                    END-PERFORM                                                          |                                  
+   000205                                                                                         |                                  
+   000206                    OPEN INPUT CUSTOMER-FILE                                             |48                                
+   000207                    MOVE 'N' TO WS-EOF                                                   |106                               
+   000208                    PERFORM UNTIL EOF-YES                                                |107                               
+   000209      1                 READ CUSTOMER-FILE                                               |48                                
+   000210      2                     AT END SET EOF-YES TO TRUE                                   |107                               
+   000211      1                     NOT AT END                                                   |                                  
+   000212      2                         ADD 1 TO WS-CUST-COUNT                                   |127                               
+   000213      2                         PERFORM 2100-INSERT                                      |219                               
+   000214      1                 END-READ                                                         |                                  
+   000215                    END-PERFORM                                                          |                                  
+   000216                    CLOSE CUSTOMER-FILE.                                                 |48                                
+   000217                                                                                         |                                  
+   000218               *    insert current CUST-REC : bucket first, then overflow backup         |                                  
+   000219                2100-INSERT.                                                             |                                  
+   000220                    COMPUTE WS-HV  = CR-ID * 2654435761                                  |114 50                            
+   000221                    COMPUTE WS-BKT = FUNCTION MOD(WS-HV, NBKT) + 1                       |111 IFN 114 74                    
+   000222                    MOVE 'N' TO WS-PLACED                                                |115                               
+   000223                    PERFORM VARYING WS-J FROM 1 BY 1                                     |109                               
+   000224                            UNTIL WS-J > BSLOTS OR PLACED-YES                            |109 75 116                        
+   000225      1                 IF P-KEY(WS-BKT, WS-J) = 0                                       |111 109 85                        
+   000226      2                     MOVE CR-ID   TO P-KEY(WS-BKT, WS-J)                          |50 111 109 85                     
+   000227      2                     MOVE CR-NAME TO P-NAME(WS-BKT, WS-J)                         |51 111 109 86                     
+   000228      2                     ADD 1 TO B-OCC(WS-BKT)                                       |111 88                            
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      TINYJOIN  Date 06/13/2026  Time 19:50:20   Page     6               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000229      2                     ADD 1 TO WS-PLACED-BUCKET                                    |128                               
+   000230      2                     SET PLACED-YES TO TRUE                                       |116                               
+   000231      1                 END-IF                                                           |                                  
+   000232                    END-PERFORM                                                          |                                  
+   000233                    IF B-OCC(WS-BKT) > WS-MAX-OCC                                        |111 88 131                        
+   000234      1                 MOVE B-OCC(WS-BKT) TO WS-MAX-OCC                                 |111 88 131                        
+   000235                    END-IF                                                               |                                  
+   000236                    IF NOT PLACED-YES                                                    |116                               
+   000237      1                 PERFORM 2200-INSERT-OVF                                          |241                               
+   000238                    END-IF.                                                              |                                  
+   000239                                                                                         |                                  
+   000240               *    backup table : linear probe from a second hash of the key            |                                  
+   000241                2200-INSERT-OVF.                                                         |                                  
+   000242                    COMPUTE WS-OH = FUNCTION MOD(CR-ID * 40503, OVF-CAP)                 |112 IFN 50 76                     
+   000243                    MOVE 'N' TO WS-PLACED                                                |115                               
+   000244                    PERFORM VARYING WS-I FROM 0 BY 1                                     |108                               
+   000245                            UNTIL WS-I >= OVF-CAP OR PLACED-YES                          |108 76 116                        
+   000246      1                 COMPUTE WS-STMP = WS-OH + WS-I                                   |113 112 108                       
+   000247      1                 COMPUTE WS-S = FUNCTION MOD(WS-STMP, OVF-CAP) + 1                |110 IFN 113 76                    
+   000248      1                 IF O-KEY(WS-S) = 0                                               |110 93                            
+   000249      2                     MOVE CR-ID   TO O-KEY(WS-S)                                  |50 110 93                         
+   000250      2                     MOVE CR-NAME TO O-NAME(WS-S)                                 |51 110 94                         
+   000251      2                     ADD 1 TO WS-PLACED-OVF                                       |129                               
+   000252      2                     SET PLACED-YES TO TRUE                                       |116                               
+   000253      1                 END-IF                                                           |                                  
+   000254                    END-PERFORM                                                          |                                  
+   000255                    IF NOT PLACED-YES                                                    |116                               
+   000256      1                 ADD 1 TO WS-HARD-FAIL                                            |130                               
+   000257                    END-IF.                                                              |                                  
+   000258                                                                                         |                                  
+   000259               ******************************************************************        |                                  
+   000260               *  3000 -- probe with ORDERS.DAT and emit the joined rows                 |                                  
+   000261               ******************************************************************        |                                  
+   000262                3000-JOIN SECTION.                                                       |                                  
+   000263                3000-DO-JOIN.                                                            |                                  
+   000264                    OPEN INPUT ORDERS-FILE                                               |53                                
+   000265                    OPEN OUTPUT JOINED-FILE                                              |59                                
+   000266                    MOVE 'N' TO WS-EOF                                                   |106                               
+   000267                    PERFORM UNTIL EOF-YES                                                |107                               
+   000268      1                 READ ORDERS-FILE                                                 |53                                
+   000269      2                     AT END SET EOF-YES TO TRUE                                   |107                               
+   000270      1                     NOT AT END                                                   |                                  
+   000271      2                         ADD 1 TO WS-ORDER-COUNT                                  |132                               
+   000272      2                         PERFORM 3100-PROBE                                       |290                               
+   000273      2                         IF FOUND-YES                                             |118                               
+   000274      3                             ADD 1 TO WS-MATCH-COUNT                              |133                               
+   000275      3                             MOVE OR-ID         TO JN-OID                         |55 61                             
+   000276      3                             MOVE OR-CID        TO JN-CID                         |56 63                             
+   000277      3                             MOVE WS-RESULT-NAME TO JN-NAME                       |121 65                            
+   000278      3                             MOVE OR-AMT        TO JN-AMT                         |57 67                             
+   000279      3                             MOVE SPACES TO JN-REC(9:1) JN-REC(16:1)              |IMP                               
+   000280      3                                            JN-REC(37:1)                          |60 60 60                          
+   000281      3                             WRITE JN-REC                                         |60                                
+   000282      3                             PERFORM 3200-SAMPLE                                  |320                               
+   000283      2                         END-IF                                                   |                                  
+   000284      1                 END-READ                                                         |                                  
+   000285                    END-PERFORM                                                          |                                  
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      TINYJOIN  Date 06/13/2026  Time 19:50:20   Page     7               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000286                    CLOSE ORDERS-FILE                                                    |53                                
+   000287                    CLOSE JOINED-FILE.                                                   |59                                
+   000288                                                                                         |                                  
+   000289               *    DEREFERENCE : recompute the bucket from the key, scan <= B           |                                  
+   000290                3100-PROBE.                                                              |                                  
+   000291                    COMPUTE WS-HV  = OR-CID * 2654435761                                 |114 56                            
+   000292                    COMPUTE WS-BKT = FUNCTION MOD(WS-HV, NBKT) + 1                       |111 IFN 114 74                    
+   000293                    MOVE 'N' TO WS-FOUND                                                 |117                               
+   000294                    PERFORM VARYING WS-J FROM 1 BY 1                                     |109                               
+   000295                            UNTIL WS-J > BSLOTS OR FOUND-YES                             |109 75 118                        
+   000296      1                 IF P-KEY(WS-BKT, WS-J) = OR-CID                                  |111 109 85 56                     
+   000297      2                     MOVE P-NAME(WS-BKT, WS-J) TO WS-RESULT-NAME                  |111 109 86 121                    
+   000298      2                     SET FOUND-YES TO TRUE                                        |118                               
+   000299      1                 END-IF                                                           |                                  
+   000300                    END-PERFORM                                                          |                                  
+   000301                    IF NOT FOUND-YES                                                     |118                               
+   000302      1                 COMPUTE WS-OH = FUNCTION MOD(OR-CID * 40503, OVF-CAP)            |112 IFN 56 76                     
+   000303      1                 MOVE 'N' TO WS-STOP                                              |119                               
+   000304      1                 PERFORM VARYING WS-I FROM 0 BY 1                                 |108                               
+   000305      1                         UNTIL WS-I >= OVF-CAP OR FOUND-YES OR STOP-YES           |108 76 118 120                    
+   000306      2                     COMPUTE WS-STMP = WS-OH + WS-I                               |113 112 108                       
+   000307      2                     COMPUTE WS-S = FUNCTION MOD(WS-STMP, OVF-CAP) + 1            |110 IFN 113 76                    
+   000308      2                     IF O-KEY(WS-S) = OR-CID                                      |110 93 56                         
+   000309      3                         MOVE O-NAME(WS-S) TO WS-RESULT-NAME                      |110 94 121                        
+   000310      3                         SET FOUND-YES TO TRUE                                    |118                               
+   000311      2                     ELSE                                                         |                                  
+   000312      3                         IF O-KEY(WS-S) = 0                                       |110 93                            
+   000313      4                             SET STOP-YES TO TRUE                                 |120                               
+   000314      3                         END-IF                                                   |                                  
+   000315      2                     END-IF                                                       |                                  
+   000316      1                 END-PERFORM                                                      |                                  
+   000317                    END-IF.                                                              |                                  
+   000318                                                                                         |                                  
+   000319               *    keep the first few matches for an on-screen sample                   |                                  
+   000320                3200-SAMPLE.                                                             |                                  
+   000321                    IF WS-SAMPLE < 5                                                     |145                               
+   000322      1                 ADD 1 TO WS-SAMPLE                                               |145                               
+   000323      1                 DISPLAY '   order ' OR-ID ' -> cust ' OR-CID                     |55 56                             
+   000324      1                         ' = ' WS-RESULT-NAME                                     |121                               
+   000325                    END-IF.                                                              |                                  
+   000326                                                                                         |                                  
+   000327               ******************************************************************        |                                  
+   000328               *  9000 -- the report : density + handle width                            |                                  
+   000329               ******************************************************************        |                                  
+   000330                9000-REPORT SECTION.                                                     |                                  
+   000331                9000-RPT.                                                                |                                  
+   000332                    COMPUTE WS-PRIM-CAP = NBKT * BSLOTS                                  |136 74 75                         
+   000333                    COMPUTE WS-LOAD-PCT = 100.0 * WS-PLACED-BUCKET / WS-PRIM-CAP         |137 128 136                       
+   000334                    COMPUTE WS-OVF-PCT  = 100.0 * WS-PLACED-OVF / OVF-CAP                |138 129 76                        
+   000335                    COMPUTE WS-MATCH-PCT =                                               |144                               
+   000336                            100.0 * WS-MATCH-COUNT / WS-ORDER-COUNT                      |133 132                           
+   000337                                                                                         |                                  
+   000338               *    handle width: in-bucket = 3 bits (log2 8), overflow = 10 bits        |                                  
+   000339               *    (log2 768).  Compare to a 4-byte (32-bit) record pointer/RRN.        |                                  
+   000340                    COMPUTE WS-TINY-BITS-TOT =                                           |139                               
+   000341                            WS-PLACED-BUCKET * 3 + WS-PLACED-OVF * 10                    |128 129                           
+   000342                    COMPUTE WS-TINY-BYTES = WS-TINY-BITS-TOT / 8                         |140 139                           
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      TINYJOIN  Date 06/13/2026  Time 19:50:20   Page     8               
+   LineID  PL SL  ----+-*A-1-B--+----2----+----3----+----4----+----5----+----6----+----7-|--+----8 Map and Cross Reference           
+0  000343                    COMPUTE WS-FULL-BYTES = WS-CUST-COUNT * 4                            |141 127                           
+   000344                    COMPUTE WS-RATIO   = WS-FULL-BYTES / WS-TINY-BYTES                   |142 141 140                       
+   000345                    COMPUTE WS-BLEND-BITS = WS-TINY-BITS-TOT / WS-CUST-COUNT             |143 139 127                       
+   000346                                                                                         |                                  
+   000347                    DISPLAY ' '                                                          |                                  
+   000348                    DISPLAY '==============================================='            |                                  
+   000349                    DISPLAY '  TINYJOIN -- tiny-pointer hash join (COBOL)'               |                                  
+   000350                    DISPLAY '==============================================='            |                                  
+   000351                    DISPLAY ' '                                                          |                                  
+   000352                    DISPLAY '  Relational JOIN:'                                         |                                  
+   000353                    MOVE WS-ORDER-COUNT TO WS-ED7                                        |132 149                           
+   000354                    DISPLAY '    ORDERS rows probed  : ' WS-ED7                          |149                               
+   000355                    MOVE WS-MATCH-COUNT TO WS-ED7                                        |133 149                           
+   000356                    DISPLAY '    matched (joined)    : ' WS-ED7                          |149                               
+   000357                            '   (' WS-MATCH-PCT ' %)'                                    |144                               
+   000358                    DISPLAY ' '                                                          |                                  
+   000359                    DISPLAY '  DENSITY (how tightly the table packs):'                   |                                  
+   000360                    MOVE WS-CUST-COUNT TO WS-ED6                                         |127 148                           
+   000361                    DISPLAY '    customers placed    : ' WS-ED6                          |148                               
+   000362                    MOVE WS-PRIM-CAP TO WS-ED6                                           |136 148                           
+   000363                    DISPLAY '    primary capacity    : ' WS-ED6                          |148                               
+   000364                            '   (' NBKT ' buckets x ' BSLOTS ')'                         |74 75                             
+   000365                    MOVE WS-PLACED-BUCKET TO WS-ED6                                      |128 148                           
+   000366                    DISPLAY '    placed in buckets   : ' WS-ED6                          |148                               
+   000367                            '   load ' WS-LOAD-PCT ' %'                                  |137                               
+   000368                    MOVE WS-PLACED-OVF TO WS-ED6                                         |129 148                           
+   000369                    DISPLAY '    spilled to backup   : ' WS-ED6                          |148                               
+   000370                            '   (' WS-OVF-PCT ' % of backup used)'                       |138                               
+   000371                    MOVE WS-HARD-FAIL TO WS-ED6                                          |130 148                           
+   000372                    DISPLAY '    lost (unplaceable)  : ' WS-ED6                          |148                               
+   000373                            '   <- lossless'                                             |                                  
+   000374                    MOVE WS-MAX-OCC TO WS-ED2                                            |131 150                           
+   000375                    DISPLAY '    max bucket fill     : ' WS-ED2 ' / ' BSLOTS             |150 75                            
+   000376                            '   (probe is bounded by B, no tail)'                        |                                  
+   000377                    DISPLAY ' '                                                          |                                  
+   000378                    DISPLAY '  HANDLE WIDTH (to point at a customer record):'            |                                  
+   000379                    DISPLAY '    full pointer (RRN)  :  32 bits  = 4 bytes each'         |                                  
+   000380                    DISPLAY '    tiny pointer        :   3 bits in-bucket,'              |                                  
+   000381                    DISPLAY '                          10 bits if in backup'             |                                  
+   000382                    DISPLAY '    blended             : ' WS-BLEND-BITS                   |143                               
+   000383                            ' bits per customer'                                         |                                  
+   000384                    MOVE WS-FULL-BYTES TO WS-ED7                                         |141 149                           
+   000385                    DISPLAY '    index of all custs  : full ' WS-ED7 ' bytes'            |149                               
+   000386                    MOVE WS-TINY-BYTES TO WS-ED7                                         |140 149                           
+   000387                    DISPLAY '                          tiny ' WS-ED7 ' bytes'            |149                               
+   000388                            '   (' WS-RATIO 'x smaller)'                                 |142                               
+   000389                    DISPLAY ' '                                                          |                                  
+   000390                    DISPLAY '  The key recomputes the bucket, so the stored'             |                                  
+   000391                    DISPLAY '  reference is just the slot index -- the paper''s'         |                                  
+   000392                    DISPLAY '  tiny pointer -- not a full record address.'               |                                  
+   000393                    DISPLAY '==============================================='.           |                                  
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      TINYJOIN  Date 06/13/2026  Time 19:50:20   Page     9               
+0An "M" preceding a data-name reference indicates that the data-name is modified by this reference.
+  
+  Defined   Cross-reference of data names   References                                                                               
+  
+       88   B-OCC. . . . . . . . . . . . .  M197 M228 233 234                                                                                                                                    
+       75   BSLOTS . . . . . . . . . . . .  198 224 295 332 364 375                                                                                                                              
+       87   BUCKET-OCC                                                                                                                                                                           
+       50   CR-ID. . . . . . . . . . . . .  M168 220 226 242 249                                                                                                                                 
+       51   CR-NAME. . . . . . . . . . . .  M170 M173 227 250                                                                                                                                    
+       79   CUST-BASE. . . . . . . . . . .  168 184                                                                                                                                              
+       99   CUST-EOF                                                                                                                                                                             
+       98   CUST-OK                                                                                                                                                                              
+       49   CUST-REC . . . . . . . . . . .  174                                                                                                                                                  
+       97   CUST-STATUS. . . . . . . . . .  33                                                                                                                                                   
+       48   CUSTOMER-FILE. . . . . . . . .  30 166 176 206 209 216                                                                                                                               
+      107   EOF-YES. . . . . . . . . . . .  208 M210 267 M269                                                                                                                                    
+      118   FOUND-YES. . . . . . . . . . .  273 295 M298 301 305 M310                                                                                                                            
+       67   JN-AMT . . . . . . . . . . . .  M278                                                                                                                                                 
+       63   JN-CID . . . . . . . . . . . .  M276                                                                                                                                                 
+       65   JN-NAME. . . . . . . . . . . .  M277                                                                                                                                                 
+       61   JN-OID . . . . . . . . . . . .  M275                                                                                                                                                 
+       60   JN-REC . . . . . . . . . . . .  M280 281                                                                                                                                             
+      103   JN-STATUS. . . . . . . . . . .  43                                                                                                                                                   
+       59   JOINED-FILE. . . . . . . . . .  40 265 287                                                                                                                                           
+       77   N-CUST . . . . . . . . . . . .  167 182                                                                                                                                              
+       78   N-ORDER. . . . . . . . . . . .  180                                                                                                                                                  
+       74   NBKT . . . . . . . . . . . . .  196 221 292 332 364                                                                                                                                  
+       92   O-CELL                                                                                                                                                                               
+       93   O-KEY. . . . . . . . . . . . .  M203 248 M249 308 312                                                                                                                                
+       94   O-NAME . . . . . . . . . . . .  M250 309                                                                                                                                             
+       57   OR-AMT . . . . . . . . . . . .  M185 278                                                                                                                                             
+       56   OR-CID . . . . . . . . . . . .  M184 276 291 296 302 308 323                                                                                                                         
+       55   OR-ID. . . . . . . . . . . . .  M183 275 323                                                                                                                                         
+      102   ORD-EOF                                                                                                                                                                              
+      101   ORD-OK                                                                                                                                                                               
+       54   ORD-REC. . . . . . . . . . . .  186                                                                                                                                                  
+      100   ORD-STATUS . . . . . . . . . .  38                                                                                                                                                   
+       53   ORDERS-FILE. . . . . . . . . .  35 179 188 264 268 286                                                                                                                               
+       91   OVERFLOW-STORE                                                                                                                                                                       
+       76   OVF-CAP. . . . . . . . . . . .  202 242 245 247 302 305 307 334                                                                                                                      
+       83   P-BUCKET                                                                                                                                                                             
+       85   P-KEY. . . . . . . . . . . . .  M199 225 M226 296                                                                                                                                    
+       86   P-NAME . . . . . . . . . . . .  M227 297                                                                                                                                             
+       84   P-SLOT                                                                                                                                                                               
+      116   PLACED-YES . . . . . . . . . .  224 M230 236 245 M252 255                                                                                                                            
+       82   PRIMARY-STORE                                                                                                                                                                        
+      120   STOP-YES . . . . . . . . . . .  305 M313                                                                                                                                             
+      111   WS-BKT . . . . . . . . . . . .  M221 225 226 227 228 233 234 M292 296 297                                                                                                            
+      143   WS-BLEND-BITS. . . . . . . . .  M345 382                                                                                                                                             
+      124   WS-CIDX. . . . . . . . . . . .  M182 184                                                                                                                                             
+      127   WS-CUST-COUNT. . . . . . . . .  M212 343 345 360                                                                                                                                     
+      150   WS-ED2 . . . . . . . . . . . .  M374 375                                                                                                                                             
+      148   WS-ED6 . . . . . . . . . . . .  M360 361 M362 363 M365 366 M368 369 M371 372                                                                                                         
+      149   WS-ED7 . . . . . . . . . . . .  M353 354 M355 356 M384 385 M386 387                                                                                                                  
+      106   WS-EOF . . . . . . . . . . . .  M207 M266                                                                                                                                            
+      117   WS-FOUND . . . . . . . . . . .  M293                                                                                                                                                 
+      141   WS-FULL-BYTES. . . . . . . . .  M343 344 384                                                                                                                                         
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      TINYJOIN  Date 06/13/2026  Time 19:50:20   Page    10               
+0 Defined   Cross-reference of data names   References                                                                               
+  
+      130   WS-HARD-FAIL . . . . . . . . .  M256 371                                                                                                                                             
+      114   WS-HV. . . . . . . . . . . . .  M220 221 M291 292                                                                                                                                    
+      108   WS-I . . . . . . . . . . . . .  M167 167 168 169 M180 180 183 M196 196 197 199 M202 202 203 M244 245 246 M304                                                                        
+                                            305 306                                                                                                                                              
+      122   WS-IDX-Z . . . . . . . . . . .  M169 172                                                                                                                                             
+      109   WS-J . . . . . . . . . . . . .  M198 198 199 M223 224 225 226 227 M294 295 296 297                                                                                                   
+      137   WS-LOAD-PCT. . . . . . . . . .  M333 367                                                                                                                                             
+      133   WS-MATCH-COUNT . . . . . . . .  M274 336 355                                                                                                                                         
+      144   WS-MATCH-PCT . . . . . . . . .  M335 357                                                                                                                                             
+      131   WS-MAX-OCC . . . . . . . . . .  233 M234 374                                                                                                                                         
+      112   WS-OH. . . . . . . . . . . . .  M242 246 M302 306                                                                                                                                    
+      132   WS-ORDER-COUNT . . . . . . . .  M271 336 353                                                                                                                                         
+      138   WS-OVF-PCT . . . . . . . . . .  M334 370                                                                                                                                             
+      115   WS-PLACED. . . . . . . . . . .  M222 M243                                                                                                                                            
+      128   WS-PLACED-BUCKET . . . . . . .  M229 333 341 365                                                                                                                                     
+      129   WS-PLACED-OVF. . . . . . . . .  M251 334 341 368                                                                                                                                     
+      136   WS-PRIM-CAP. . . . . . . . . .  M332 333 362                                                                                                                                         
+      142   WS-RATIO . . . . . . . . . . .  M344 388                                                                                                                                             
+      121   WS-RESULT-NAME . . . . . . . .  277 M297 M309 324                                                                                                                                    
+      110   WS-S . . . . . . . . . . . . .  M247 248 249 250 M307 308 309 312                                                                                                                    
+      145   WS-SAMPLE. . . . . . . . . . .  321 M322                                                                                                                                             
+      123   WS-SEED. . . . . . . . . . . .  M181 181 182 185                                                                                                                                     
+      113   WS-STMP. . . . . . . . . . . .  M246 247 M306 307                                                                                                                                    
+      119   WS-STOP. . . . . . . . . . . .  M303                                                                                                                                                 
+      139   WS-TINY-BITS-TOT . . . . . . .  M340 342 345                                                                                                                                         
+      140   WS-TINY-BYTES. . . . . . . . .  M342 344 386                                                                                                                                         
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      TINYJOIN  Date 06/13/2026  Time 19:50:20   Page    11               
+0Context usage is indicated by the letter preceding a procedure-name reference.
+ These letters and their meanings are:
+     A = ALTER (procedure-name)
+     D = GO TO (procedure-name) DEPENDING ON
+     E = End of range of (PERFORM) through (procedure-name)
+     G = GO TO (procedure-name)
+     P = PERFORM (procedure-name)
+     T = (ALTER) TO PROCEED TO (procedure-name)
+     U = USE FOR DEBUGGING (procedure-name)
+  
+  Defined   Cross-reference of procedures   References                                                                               
+  
+      154   0000-MAIN                                                                                                                                                                            
+      165   1000-GEN                                                                                                                                                                             
+      164   1000-GEN-DATA. . . . . . . . .  P155                                                                                                                                                 
+      194   2000-BUILD                                                                                                                                                                           
+      193   2000-BUILD-TABLE . . . . . . .  P156                                                                                                                                                 
+      219   2100-INSERT. . . . . . . . . .  P213                                                                                                                                                 
+      241   2200-INSERT-OVF. . . . . . . .  P237                                                                                                                                                 
+      263   3000-DO-JOIN                                                                                                                                                                         
+      262   3000-JOIN. . . . . . . . . . .  P157                                                                                                                                                 
+      290   3100-PROBE . . . . . . . . . .  P272                                                                                                                                                 
+      320   3200-SAMPLE. . . . . . . . . .  P282                                                                                                                                                 
+      330   9000-REPORT. . . . . . . . . .  P158                                                                                                                                                 
+      331   9000-RPT                                                                                                                                                                             
+1PP 5737-L11 IBM COBOL for Linux                     1.2.0      TINYJOIN  Date 06/13/2026  Time 19:50:20   Page    12               
+0 Defined   Cross-reference of programs     References                                                                               
+  
+        2   TINYJOIN                                                                                                                                                                             
+-* Statistics for COBOL program TINYJOIN:
+ *    Source records = 393
+ *    Data Division statements = 75
+ *    Procedure Division statements = 150
+0Locale = en_GB.UTF-8
+0End of compilation 1,  program TINYJOIN,  no statements flagged.
+0Return code 0
