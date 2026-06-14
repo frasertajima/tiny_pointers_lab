@@ -1,0 +1,194 @@
+! ============================================================================
+!  spacedict.cuf -- application #4: a space-efficient DICTIONARY.
+!
+!  The question the paper answers: storing N key->value pairs, how few bits of
+!  OVERHEAD (beyond the raw values) must a dictionary pay? A conventional
+!  open-addressing table pays twice:
+!     (a) it stores the full 8-byte KEY in every slot (to probe/compare), and
+!     (b) it must run below load 1, so a 1/load - 1 fraction of slots is slack.
+!  A tiny-pointer (relaxed) dictionary stores NO key in the table -- the key
+!  owns a log2(B)-bit tiny pointer to its value -- so its overhead is just the
+!  tiny pointers plus a small backup region.
+!
+!  This program (1) BUILDS both dictionaries and verifies the tiny one returns
+!  every value correctly WITHOUT storing keys (relaxed retrieval), then
+!  (2) reports the overhead bits/key for both, swept over the value width V.
+!
+!  Output (CSV):
+!    SPACEHDR,<N>,<load>,<B>,<tiny_ok>,<lp_ok>
+!    SPACE,<V_bytes>,<lp_overhead_bits_per_key>,<tiny_overhead_bits_per_key>
+! ============================================================================
+
+module spk
+  use cudafor
+  use tinymap
+  implicit none
+  integer, parameter :: PPB = 256
+contains
+
+  ! TINY build: assign each key a slot (its tiny pointer) and store ONLY the
+  ! value there. The store still holds keys during build (scaffold); a true
+  ! relaxed dict discards them and keeps just valstore + the per-key handles.
+  attributes(global) subroutine tiny_assign(store, nbkt, B, ovf_base, ovf_cap, &
+                                             keys, vals, n, handle, valstore, failc)
+    integer(8), device :: store(*), keys(n)
+    integer,    device :: vals(n), handle(n), valstore(*), failc(1)
+    integer,    value  :: nbkt, B, ovf_base, ovf_cap, n
+    integer :: tid, s, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > n) return
+    s = ttd_insert_r(store, nbkt, B, ovf_base, ovf_cap, keys(tid))
+    handle(tid) = s
+    if (s >= 0) then
+      valstore(s + 1) = vals(tid)
+    else
+      istat = atomicadd(failc(1), 1)
+    end if
+  end subroutine tiny_assign
+
+  ! RELAXED retrieval: recover the value from the handle alone -- NO key read.
+  attributes(global) subroutine tiny_deref(handle, n, valstore, chk)
+    integer,    device :: handle(n), valstore(*)
+    integer(8), device :: chk(1)
+    integer,    value  :: n
+    integer :: tid, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > n) return
+    if (handle(tid) >= 0) istat = atomicadd(chk(1), int(valstore(handle(tid) + 1), 8))
+  end subroutine tiny_deref
+
+  ! LP build: store key AND value in every occupied slot.
+  attributes(global) subroutine lp_build_kv(store, vstore, cap, keys, vals, n, failc)
+    integer(8), device :: store(*), keys(n)
+    integer,    device :: vstore(*), vals(n), failc(1)
+    integer,    value  :: cap, n
+    integer :: tid, s, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > n) return
+    s = lpd_insert(store, cap, keys(tid))
+    if (s >= 0) then
+      vstore(s + 1) = vals(tid)
+    else
+      istat = atomicadd(failc(1), 1)
+    end if
+  end subroutine lp_build_kv
+
+  ! LP lookup: must probe by KEY to find the value.
+  attributes(global) subroutine lp_lookup(store, vstore, cap, keys, n, chk)
+    integer(8), device :: store(*), keys(n)
+    integer,    device :: vstore(*)
+    integer(8), device :: chk(1)
+    integer,    value  :: cap, n
+    integer :: tid, s, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > n) return
+    s = lpd_find(store, cap, keys(tid))
+    if (s >= 0) istat = atomicadd(chk(1), int(vstore(s + 1), 8))
+  end subroutine lp_lookup
+
+  attributes(global) subroutine fill_empty(store, n)
+    integer(8), device :: store(n)
+    integer,    value  :: n
+    integer :: tid
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid <= n) store(tid) = -1_8
+  end subroutine fill_empty
+end module spk
+
+! ============================================================================
+program spacedict
+  use cudafor
+  use tinymap
+  use spk
+  implicit none
+
+  integer :: N, i, istat, narg, B, blocks, fails, cap, vi
+  real    :: load
+  character(len=64) :: arg
+
+  integer(8), allocatable :: h_keys(:)
+  integer,    allocatable :: h_vals(:)
+  integer(8) :: chk_host
+  integer(8), device, allocatable :: d_keys(:), d_chk(:)
+  integer,    device, allocatable :: d_vals(:), d_handle(:), d_valstore(:), d_fail(:)
+  integer,    device, allocatable :: lp_vstore(:)
+  integer(8), device, allocatable :: lp_store(:)
+
+  type(tiny_map) :: map
+  integer(8) :: chk_dev
+  integer    :: tiny_ok, lp_ok, tinybits
+  real       :: lp_oh, tiny_oh
+  integer    :: Vlist(6)
+
+  N    = ishft(1, 20)
+  B    = 16
+  load = 0.90
+  narg = command_argument_count()
+  if (narg >= 1) then; call get_command_argument(1, arg); read(arg,*) N;    end if
+  if (narg >= 2) then; call get_command_argument(2, arg); read(arg,*) load; end if
+
+  allocate(h_keys(N), h_vals(N))
+  chk_host = 0_8
+  do i = 1, N
+    h_keys(i) = int(i, 8) * 2654435761_8
+    h_vals(i) = int(iand(int(i,8) * 40503_8, 2147483647_8))
+    chk_host  = chk_host + int(h_vals(i), 8)
+  end do
+  allocate(d_keys(N), d_vals(N), d_handle(N), d_fail(1), d_chk(1))
+  d_keys = h_keys; d_vals = h_vals
+  blocks = (N + PPB - 1) / PPB
+
+  print '(a)', '# spacedict: dictionary overhead bits/key (tiny stores no keys)'
+  print '(a,i0,a,f0.2,a,i0)', '# N=', N, '  load=', load, '  B=', B
+
+  ! ===================== TINY relaxed dictionary =====================
+  call tt_create_r(map, N, B, load, 0.15)
+  allocate(d_valstore(map%nslots))
+  d_fail = 0
+  call tiny_assign<<<blocks, PPB>>>(map%store, map%nbkt, map%B, map%ovf_base, &
+                map%ovf_cap, d_keys, d_vals, N, d_handle, d_valstore, d_fail)
+  istat = cudaDeviceSynchronize()
+  fails = d_fail(1)
+  d_chk = 0_8
+  call tiny_deref<<<blocks, PPB>>>(d_handle, N, d_valstore, d_chk)
+  istat = cudaDeviceSynchronize()
+  chk_dev = d_chk(1)
+  tiny_ok = 0
+  if (chk_dev == chk_host .and. fails == 0) tiny_ok = 1
+
+  ! ===================== LP key+value dictionary =====================
+  cap = int(ceiling(real(N) / load))
+  allocate(lp_store(cap), lp_vstore(cap))
+  call fill_empty<<<(cap+PPB-1)/PPB, PPB>>>(lp_store, cap)
+  istat = cudaDeviceSynchronize()
+  d_fail = 0
+  call lp_build_kv<<<blocks, PPB>>>(lp_store, lp_vstore, cap, d_keys, d_vals, N, d_fail)
+  istat = cudaDeviceSynchronize()
+  d_chk = 0_8
+  call lp_lookup<<<blocks, PPB>>>(lp_store, lp_vstore, cap, d_keys, N, d_chk)
+  istat = cudaDeviceSynchronize()
+  chk_dev = d_chk(1)
+  lp_ok = 0
+  if (chk_dev == chk_host) lp_ok = 1
+
+  print '(a,i0,a,i0)', '# tiny build failures = ', fails, '   (relaxed deref reads no keys)'
+  print '(a,i0,a,i0,a,i0)', 'SPACEHDR,', N, ',', tiny_ok, ',', lp_ok
+
+  ! ===================== overhead accounting (sweep V) =====================
+  ! Per key, OVERHEAD = (stored bytes - raw value bytes) * 8 / N.
+  !   LP   : cap slots * (8-byte key + V) ; overhead = (8+V)/load - V  (bytes/key)
+  !   TINY : value store (1/load * V) carries the only slack; the key contributes
+  !          a tiny pointer of log2(B) bits and no stored key.
+  tinybits = int(ceiling(log(real(B)) / log(2.0)))
+  print '(a)', 'tag,V_bytes,lp_overhead_bits_per_key,tiny_overhead_bits_per_key'
+  Vlist = (/ 2, 4, 8, 16, 32, 64 /)
+  do vi = 1, 6
+    i = Vlist(vi)
+    lp_oh   = ((8.0 + real(i)) / load - real(i)) * 8.0          ! bits/key
+    tiny_oh = (real(i) / load - real(i)) * 8.0 + real(tinybits) ! value slack + tiny ptr
+    print '(a,i0,a,f0.1,a,f0.1)', 'SPACE,', i, ',', lp_oh, ',', tiny_oh
+  end do
+
+  call tt_destroy(map)
+  deallocate(d_keys, d_vals, d_handle, d_valstore, d_fail, d_chk, lp_store, lp_vstore)
+end program spacedict

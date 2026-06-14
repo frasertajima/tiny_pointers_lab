@@ -1,0 +1,214 @@
+! ============================================================================
+!  joindemo.cuf  --  GPU hash JOIN / group-by built on the reusable tiny_map.
+!
+!    BUILD side:  R distinct keys -> a tiny_map (key -> slot), at load ~lf.
+!    PROBE side:  S rows (S >> R); each probe key is looked up and the matched
+!                 slot is written to an output array  (out(i) = slot, -1 if no
+!                 match). That output IS the join: a hash GROUP-BY is the same
+!                 probe with an atomicAdd into agg(slot) instead.
+!
+!  The probe kernel calls ttd_find / lpd_find DEVICE functions inline -- the
+!  "generic, fused" path: the lookup is part of the user's own kernel, no
+!  extra launches. The timed probe does no atomics, so it measures pure
+!  lookup throughput; correctness is counted afterwards (untimed).
+!
+!  CSV: load,R,S,B,tt_build_Mr,tt_probe_Mr,lp_build_Mr,lp_probe_Mr,tt_fail_pct,tt_match_pct,lp_match_pct
+! ============================================================================
+
+module joinkernels
+  use cudafor
+  use tinymap
+  implicit none
+contains
+  attributes(global) subroutine gen_build(keys, rowids, n)
+    integer(8), device :: keys(n)
+    integer,    device :: rowids(n)
+    integer,    value  :: n
+    integer :: tid
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid <= n) then
+      keys(tid)   = int(tid, 8)
+      rowids(tid) = tid
+    end if
+  end subroutine gen_build
+
+  attributes(global) subroutine gen_probe(qkeys, ns, R)
+    integer(8), device :: qkeys(ns)
+    integer,    value  :: ns, R
+    integer :: tid
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid <= ns) qkeys(tid) = 1_8 + mod(int(tid - 1, 8), int(R, 8))
+  end subroutine gen_probe
+
+  ! tiny-pointer JOIN probe (fused ttd_find, no atomics in the timed path)
+  attributes(global) subroutine probe_tt(store, nbkt, B, qkeys, ns, out)
+    integer(8), device :: store(*), qkeys(ns)
+    integer,    device :: out(ns)
+    integer,    value  :: nbkt, B, ns
+    integer :: tid
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > ns) return
+    out(tid) = ttd_find(store, nbkt, B, qkeys(tid))
+  end subroutine probe_tt
+
+  ! linear-probe JOIN probe (fused lpd_find)
+  attributes(global) subroutine probe_lp(store, cap, qkeys, ns, out)
+    integer(8), device :: store(*), qkeys(ns)
+    integer,    device :: out(ns)
+    integer,    value  :: cap, ns
+    integer :: tid
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > ns) return
+    out(tid) = lpd_find(store, cap, qkeys(tid))
+  end subroutine probe_lp
+
+  ! correctness: count matches (out >= 0). untimed.
+  attributes(global) subroutine count_matches(out, ns, cnt)
+    integer, device :: out(ns), cnt(1)
+    integer, value  :: ns
+    integer :: tid, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > ns) return
+    if (out(tid) >= 0) istat = atomicadd(cnt(1), 1)
+  end subroutine count_matches
+end module joinkernels
+
+! ============================================================================
+program joindemo
+  use cudafor
+  use tinymap
+  use joinkernels
+  implicit none
+
+  integer :: log2R, B, log2S, R, S, i, istat, narg, blocksB, blocksS, rep
+  integer :: nfail, cap, mcount
+  character(len=64) :: arg, arg4
+  logical :: csv
+  real :: lf, ms, best
+  real, dimension(6) :: lfs = (/ 0.50, 0.70, 0.80, 0.90, 0.95, 0.99 /)
+
+  integer(8), device, allocatable :: d_bkeys(:), d_qkeys(:)
+  integer,    device, allocatable :: d_browid(:), d_out(:), d_cnt(:)
+  integer,    device, allocatable :: d_lppay(:), d_lpfail(:)
+  integer(8), device, allocatable :: d_lpstore(:)
+  type(tiny_map) :: map
+  type(cudaEvent) :: e0, e1
+  real :: ttb, ttp, lpb, lpp
+
+  log2R = 22; B = 16; log2S = 26
+  narg = command_argument_count()
+  if (narg >= 1) then; call get_command_argument(1, arg); read(arg,*) log2R; end if
+  if (narg >= 2) then; call get_command_argument(2, arg); read(arg,*) B;     end if
+  if (narg >= 3) then; call get_command_argument(3, arg); read(arg,*) log2S; end if
+  csv = .false.
+  if (narg >= 4) then; call get_command_argument(4, arg4); csv = (trim(arg4)=='csv'); end if
+
+  R = ishft(1, log2R)
+  S = ishft(1, log2S)
+  blocksB = (R + TT_TPB - 1) / TT_TPB
+  blocksS = (S + TT_TPB - 1) / TT_TPB
+
+  istat = cudaEventCreate(e0); istat = cudaEventCreate(e1)
+
+  allocate(d_bkeys(R), d_browid(R), d_qkeys(S), d_out(S), d_cnt(1))
+  call gen_build<<<blocksB, TT_TPB>>>(d_bkeys, d_browid, R)
+  call gen_probe<<<blocksS, TT_TPB>>>(d_qkeys, S, R)
+  istat = cudaDeviceSynchronize()
+
+  if (.not. csv) then
+    print '(a)', '======================================================================='
+    print '(a)', '  GPU hash JOIN probe:  tiny_map  vs  linear probing'
+    print '(a,i0,a,i0,a,i0)', '  build rows R=', R, '   probe rows S=', S, '   bucket B=', B
+    print '(a)', '======================================================================='
+    print '(a)', 'load |  TINY: build Mr/s  probe Mr/s |  LP: build Mr/s  probe Mr/s | tt_fail% match%'
+    print '(a)', '-----+-------------------------------+----------------------------+----------------'
+  else
+    print '(a)', 'load,R,S,B,tt_build_Mr,tt_probe_Mr,lp_build_Mr,lp_probe_Mr,tt_fail_pct,tt_match_pct,lp_match_pct'
+  end if
+
+  do i = 1, size(lfs)
+    lf = lfs(i)
+
+    ! ---------- TINY: build (best of 3) ----------
+    best = 1.0e30
+    do rep = 1, 3
+      call tt_create(map, R, B, lf)
+      istat = cudaEventRecord(e0, 0)
+      call tt_build(map, d_bkeys, d_browid, R, nfail)
+      istat = cudaEventRecord(e1, 0)
+      istat = cudaEventSynchronize(e1)
+      istat = cudaEventElapsedTime(ms, e0, e1)
+      if (ms < best) best = ms
+    end do
+    ttb = real(R) / (best * 1.0e3)
+
+    ! ---------- TINY: probe (best of 3) ----------
+    best = 1.0e30
+    do rep = 1, 3
+      istat = cudaEventRecord(e0, 0)
+      call probe_tt<<<blocksS, TT_TPB>>>(map%store, map%nbkt, map%B, d_qkeys, S, d_out)
+      istat = cudaEventRecord(e1, 0)
+      istat = cudaEventSynchronize(e1)
+      istat = cudaEventElapsedTime(ms, e0, e1)
+      if (ms < best) best = ms
+    end do
+    ttp = real(S) / (best * 1.0e3)
+    d_cnt = 0
+    call count_matches<<<blocksS, TT_TPB>>>(d_out, S, d_cnt)
+    istat = cudaDeviceSynchronize()
+    mcount = d_cnt(1)
+
+    block
+      real :: tt_match_pct, lp_match_pct, tt_fail_pct
+      integer :: lpmatched
+      tt_match_pct = 100.0 * real(mcount) / real(S)
+      tt_fail_pct  = 100.0 * real(nfail) / real(R)
+
+      ! ---------- LINEAR PROBE at the SAME slot budget ----------
+      cap = map%nslots
+      allocate(d_lpstore(cap), d_lppay(cap), d_lpfail(1))
+      best = 1.0e30
+      do rep = 1, 3
+        call k_init<<<(cap+TT_TPB-1)/TT_TPB, TT_TPB>>>(d_lpstore, cap)
+        d_lpfail = 0
+        istat = cudaDeviceSynchronize()
+        istat = cudaEventRecord(e0, 0)
+        call k_build_lp<<<blocksB, TT_TPB>>>(d_lpstore, cap, d_bkeys, d_browid, R, d_lppay, d_lpfail)
+        istat = cudaEventRecord(e1, 0)
+        istat = cudaEventSynchronize(e1)
+        istat = cudaEventElapsedTime(ms, e0, e1)
+        if (ms < best) best = ms
+      end do
+      lpb = real(R) / (best * 1.0e3)
+
+      best = 1.0e30
+      do rep = 1, 3
+        istat = cudaEventRecord(e0, 0)
+        call probe_lp<<<blocksS, TT_TPB>>>(d_lpstore, cap, d_qkeys, S, d_out)
+        istat = cudaEventRecord(e1, 0)
+        istat = cudaEventSynchronize(e1)
+        istat = cudaEventElapsedTime(ms, e0, e1)
+        if (ms < best) best = ms
+      end do
+      lpp = real(S) / (best * 1.0e3)
+      d_cnt = 0
+      call count_matches<<<blocksS, TT_TPB>>>(d_out, S, d_cnt)
+      istat = cudaDeviceSynchronize()
+      lpmatched = d_cnt(1)
+      lp_match_pct = 100.0 * real(lpmatched) / real(S)
+      deallocate(d_lpstore, d_lppay, d_lpfail)
+
+      if (csv) then
+        print '(f6.4,a,i0,a,i0,a,i0,a,f0.2,a,f0.2,a,f0.2,a,f0.2,a,f0.5,a,f0.4,a,f0.4)', &
+            lf, ',', R, ',', S, ',', B, ',', ttb, ',', ttp, ',', lpb, ',', lpp, ',', &
+            tt_fail_pct, ',', tt_match_pct, ',', lp_match_pct
+      else
+        print '(f5.2,a,f12.1,f12.1,a,f11.1,f12.1,a,f8.3,f8.2)', &
+            lf*100.0, ' |', ttb, ttp, '  |', lpb, lpp, '  |', tt_fail_pct, tt_match_pct
+      end if
+    end block
+  end do
+
+  call tt_destroy(map)
+  deallocate(d_bkeys, d_browid, d_qkeys, d_out, d_cnt)
+end program joindemo

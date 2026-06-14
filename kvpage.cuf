@@ -1,0 +1,331 @@
+! ============================================================================
+!  kvpage.cuf  --  paged KV-cache memory manager: making the "optimal stash"
+!  (arXiv:2111.12800 external-memory application) concrete on the GPU.
+!
+!  THE SETUP (vLLM-style paging, memory management only -- no transformer):
+!    * KV is split into fixed BLOCKS. A block lives in one of two tiers:
+!        HBM  pool (device memory, fast, scarce -- this 4GB A1000)
+!        HOST pool (host pinned memory, large, slow -- read over PCIe).
+!      Together they are the "external memory" array; blocks never move once
+!      placed (the paper's stability property).
+!    * A DIRECTORY (the "stash") maps a logical block key -> global block id.
+!      It is our reusable tiny_map dereference table. Locating a block is pure
+!      on-chip computation (0 external accesses); fetching it is ONE access.
+!
+!  TWO EXPERIMENTS:
+!   (1) HIT-RATIO SWEEP: vary how much of the KV is HBM-resident; show gather
+!       throughput tracks residency while the locate step stays free.
+!   (2) INDEX PLACEMENT: run the SAME gather with the directory resident in HBM
+!       vs. spilled to host memory. The resident (compact, tiny-pointer) index
+!       avoids a PCIe hop per lookup -> "single access to external memory."
+!       This is the concrete payoff of a compact stash.
+!
+!  CSV tags:  HIT,hbm_pct,Mqps,gbps,hbm_hit_pct,ok   PLACE,which,Mqps,gbps
+! ============================================================================
+
+module kvkernels
+  use cudafor
+  use tinymap
+  implicit none
+  integer(8), parameter :: KMULT = 2654435761_8   ! key scatter (bijection)
+  integer(8), parameter :: KOFF  = 1234567_8
+  integer(8), parameter :: QMULT = 2246822519_8   ! query scatter
+contains
+  attributes(device) integer function blkval(g, e) result(v)
+    integer, value :: g, e
+    v = iand(g * 131 + e, 1023)
+  end function blkval
+
+  attributes(global) subroutine build_dir(store, nbkt, B, ovf_base, ovf_cap, n, pay, failc)
+    integer(8), device :: store(*)
+    integer,    device :: pay(*), failc(1)
+    integer,    value  :: nbkt, B, ovf_base, ovf_cap, n
+    integer :: tid, slot, istat
+    integer(8) :: key
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > n) return
+    key  = int(tid - 1, 8) * KMULT + KOFF
+    slot = ttd_insert_r(store, nbkt, B, ovf_base, ovf_cap, key)   ! reliable
+    if (slot >= 0) then
+      pay(slot + 1) = tid - 1                 ! global block id = i (0-based)
+    else
+      istat = atomicadd(failc(1), 1)
+    end if
+  end subroutine build_dir
+
+  attributes(global) subroutine fill_hbm(hbm, hbm_cap, BLK)
+    integer, device :: hbm(*)
+    integer, value  :: hbm_cap, BLK
+    integer :: tid, g, e
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > hbm_cap * BLK) return
+    g = (tid - 1) / BLK
+    e = mod(tid - 1, BLK)
+    hbm(tid) = blkval(g, e)
+  end subroutine fill_hbm
+
+  attributes(global) subroutine gen_queries(qbi, nq, NB)
+    integer, device :: qbi(nq)
+    integer, value  :: nq, NB
+    integer :: tid
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid <= nq) qbi(tid) = int(iand(int(tid - 1, 8) * QMULT, int(NB - 1, 8)))
+  end subroutine gen_queries
+
+  ! THE GATHER (emulates attention KV read). dir_store/dir_pay may point at
+  ! HBM (resident) or host-mapped (spilled) memory -- same kernel either way.
+  attributes(global) subroutine gather(dir_store, nbkt, B, ovf_base, ovf_cap, dir_pay, qbi, nq, &
+                                       hbm, hbm_cap, hostp, BLK, out, hbmhit)
+    integer(8), device :: dir_store(*)
+    integer,    device :: dir_pay(*), qbi(nq), out(nq), hbmhit(1)
+    integer,    device :: hbm(*), hostp(*)
+    integer,    value  :: nbkt, B, ovf_base, ovf_cap, nq, hbm_cap, BLK
+    integer :: tid, bi, slot, gbid, e, base, acc, istat
+    integer(8) :: key
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > nq) return
+    bi   = qbi(tid)
+    key  = int(bi, 8) * KMULT + KOFF
+    slot = ttd_find_r(dir_store, nbkt, B, ovf_base, ovf_cap, key)   ! LOCATE: 0 ext accesses
+    if (slot < 0) then; out(tid) = -1; return; end if
+    gbid = dir_pay(slot + 1)
+    acc  = 0
+    if (gbid < hbm_cap) then                       ! FETCH: one tier, one access
+      base = gbid * BLK
+      do e = 1, BLK; acc = acc + hbm(base + e); end do
+      istat = atomicadd(hbmhit(1), 1)
+    else
+      base = (gbid - hbm_cap) * BLK
+      do e = 1, BLK; acc = acc + hostp(base + e); end do
+    end if
+    out(tid) = acc
+  end subroutine gather
+
+  attributes(global) subroutine reduce_i8(out, nq, total)
+    integer,    device :: out(nq)
+    integer(8), device :: total(1)
+    integer,    value  :: nq
+    integer :: tid, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > nq) return
+    if (out(tid) >= 0) istat = atomicadd(total(1), int(out(tid), 8))
+  end subroutine reduce_i8
+end module kvkernels
+
+! ============================================================================
+program kvpage
+  use iso_c_binding
+  use cudafor
+  use tinymap
+  use kvkernels
+  implicit none
+
+  integer :: log2NB, BLK, log2Q, NB, Q, i, istat, narg, hbm_cap, host_cap
+  integer :: nfail, hbmhit_h, bi, g, e
+  character(len=64) :: arg, arg4
+  logical :: csv
+  integer, dimension(5) :: hbmpcts = (/ 0, 25, 50, 75, 100 /)
+  real :: ms, best, mqps, gbps, hbytes
+  integer(8) :: total_h, expect, bs
+  integer(8), allocatable :: bsum(:)
+
+  type(tiny_map) :: dir
+  integer, device, allocatable :: d_hbm(:), d_qbi(:), d_out(:), d_hbmhit(:), d_fail(:)
+  integer(8), device, allocatable :: d_total(:)
+
+  ! host-mapped (external) host pool + spilled-directory mirror
+  type(c_ptr)    :: hp_host, hp_ds, hp_dp
+  type(c_devptr) :: dp_host, dp_ds, dp_dp
+  integer, pointer :: host_h(:) => null()
+  integer, device, pointer :: host_d(:) => null()
+  integer(8), pointer :: ds_h(:) => null()
+  integer, pointer :: dp_h(:) => null()
+  integer(8), device, pointer :: ds_d(:) => null()
+  integer, device, pointer :: dp_d(:) => null()
+
+  type(cudaEvent) :: ev0, ev1
+
+  log2NB = 18; BLK = 256; log2Q = 20
+  narg = command_argument_count()
+  if (narg >= 1) then; call get_command_argument(1, arg); read(arg,*) log2NB; end if
+  if (narg >= 2) then; call get_command_argument(2, arg); read(arg,*) BLK;    end if
+  if (narg >= 3) then; call get_command_argument(3, arg); read(arg,*) log2Q;  end if
+  csv = .false.
+  if (narg >= 4) then; call get_command_argument(4, arg4); csv = (trim(arg4)=='csv'); end if
+
+  NB = ishft(1, log2NB)
+  Q  = ishft(1, log2Q)
+  hbytes = real(BLK) * 4.0                       ! bytes fetched per query
+
+  istat = cudaEventCreate(ev0); istat = cudaEventCreate(ev1)
+
+  ! ---- directory (the stash): reliable 2-level table, resident in HBM ----
+  call tt_create_r(dir, NB, 16, 0.90, 0.15)     ! bucket B=16 + 15% overflow
+  allocate(d_fail(1)); d_fail = 0
+  call build_dir<<<(NB+TT_TPB-1)/TT_TPB, TT_TPB>>>(dir%store, dir%nbkt, dir%B, &
+        dir%ovf_base, dir%ovf_cap, NB, dir%payload, d_fail)
+  istat = cudaDeviceSynchronize()
+  nfail = d_fail(1)
+
+  ! ---- queries ----
+  allocate(d_qbi(Q), d_out(Q), d_hbmhit(1), d_total(1))
+  call gen_queries<<<(Q+TT_TPB-1)/TT_TPB, TT_TPB>>>(d_qbi, Q, NB)
+  istat = cudaDeviceSynchronize()
+
+  ! ---- host expected: blocksum table + per-query sum ----
+  allocate(bsum(0:NB-1))
+  do g = 0, NB - 1
+    bs = 0
+    do e = 0, BLK - 1
+      bs = bs + iand(g * 131 + e, 1023)
+    end do
+    bsum(g) = bs
+  end do
+  expect = 0
+  do i = 1, Q
+    bi = int(iand(int(i - 1, 8) * QMULT, int(NB - 1, 8)))
+    expect = expect + bsum(bi)
+  end do
+
+  if (.not. csv) then
+    print '(a)', '====================================================================='
+    print '(a)', '  Paged KV-cache: tiny-pointer directory (stash) over a HBM/host pool'
+    print '(a,i0,a,i0,a,f0.1,a)', '  blocks NB=', NB, '  block=', BLK, ' ints (', hbytes/1024.0, ' KB)'
+    print '(a,f0.1,a,i0,a)', '  total KV = ', real(NB)*hbytes/1.0e6, ' MB    queries Q=', Q, ''
+    print '(a,i0,a,f0.3,a,i0)', '  directory: ', dir%nslots, ' slots, ', &
+          real(dir%nslots)*12.0/1.0e6, ' MB (key8+pay4)  build fails=', nfail
+    print '(a)', '====================================================================='
+    print '(a)', 'EXP 1 -- hit-ratio sweep (directory resident in HBM):'
+    print '(a)', '  HBM% |  Mqueries/s  eff GB/s  HBM-hit%  ok'
+  else
+    print '(a)', 'tag,a,b,c,d,e'
+  end if
+
+  ! =================== EXPERIMENT 1: hit-ratio sweep ===================
+  do i = 1, size(hbmpcts)
+    hbm_cap  = int(real(NB) * real(hbmpcts(i)) / 100.0)
+    if (hbm_cap > NB) hbm_cap = NB
+    host_cap = NB - hbm_cap
+
+    ! (re)allocate + fill pools for this split
+    if (allocated(d_hbm)) deallocate(d_hbm)
+    allocate(d_hbm(max(1, hbm_cap * BLK)))
+    if (hbm_cap > 0) then
+      call fill_hbm<<<(hbm_cap*BLK+TT_TPB-1)/TT_TPB, TT_TPB>>>(d_hbm, hbm_cap, BLK)
+      istat = cudaDeviceSynchronize()
+    end if
+    ! host pool (mapped pinned) -- fill on host
+    if (c_associated(hp_host)) istat = cudaFreeHost(hp_host)
+    istat = cudaHostAlloc(hp_host, int(max(1, host_cap*BLK),c_size_t)*4_c_size_t, cudaHostAllocMapped)
+    call c_f_pointer(hp_host, host_h, [max(1, host_cap*BLK)])
+    do g = hbm_cap, NB - 1
+      do e = 0, BLK - 1
+        host_h((g - hbm_cap) * BLK + e + 1) = iand(g * 131 + e, 1023)
+      end do
+    end do
+    istat = cudaHostGetDevicePointer(dp_host, hp_host, 0)
+    call c_f_pointer(dp_host, host_d, [max(1, host_cap*BLK)])
+
+    best = 1.0e30
+    do e = 1, 3
+      d_hbmhit = 0
+      istat = cudaEventRecord(ev0, 0)
+      call gather<<<(Q+TT_TPB-1)/TT_TPB, TT_TPB>>>(dir%store, dir%nbkt, dir%B, dir%ovf_base, dir%ovf_cap, &
+            dir%payload, d_qbi, Q, d_hbm, hbm_cap, host_d, BLK, d_out, d_hbmhit)
+      istat = cudaEventRecord(ev1, 0)
+      istat = cudaEventSynchronize(ev1)
+      istat = cudaEventElapsedTime(ms, ev0, ev1)
+      if (ms < best) best = ms
+    end do
+    hbmhit_h = d_hbmhit(1)
+
+    ! correctness
+    d_total = 0
+    call reduce_i8<<<(Q+TT_TPB-1)/TT_TPB, TT_TPB>>>(d_out, Q, d_total)
+    istat = cudaDeviceSynchronize()
+    total_h = d_total(1)
+
+    mqps = real(Q) / (best * 1.0e3)
+    gbps = real(Q) * hbytes / (best * 1.0e6)
+
+    if (csv) then
+      print '(a,i0,a,f0.2,a,f0.2,a,f0.2,a,i0)', 'HIT,', hbmpcts(i), ',', mqps, ',', gbps, &
+            ',', 100.0*real(hbmhit_h)/real(Q), ',', merge(1,0,total_h==expect)
+    else
+      print '(i6,a,f11.2,f10.2,f10.2,a,i3)', hbmpcts(i), ' |', mqps, gbps, &
+            100.0*real(hbmhit_h)/real(Q), '   ', merge(1,0,total_h==expect)
+    end if
+  end do
+
+  ! =================== EXPERIMENT 2: index placement ===================
+  ! Fix HBM data residency at 50%; compare directory resident vs. spilled.
+  hbm_cap = NB / 2; host_cap = NB - hbm_cap
+  ! pools already sized for 100% from the loop's last iter -> rebuild at 50%
+  if (allocated(d_hbm)) deallocate(d_hbm)
+  allocate(d_hbm(max(1, hbm_cap*BLK)))
+  call fill_hbm<<<(hbm_cap*BLK+TT_TPB-1)/TT_TPB, TT_TPB>>>(d_hbm, hbm_cap, BLK)
+  istat = cudaDeviceSynchronize()
+  if (c_associated(hp_host)) istat = cudaFreeHost(hp_host)
+  istat = cudaHostAlloc(hp_host, int(host_cap*BLK,c_size_t)*4_c_size_t, cudaHostAllocMapped)
+  call c_f_pointer(hp_host, host_h, [host_cap*BLK])
+  do g = hbm_cap, NB - 1
+    do e = 0, BLK - 1
+      host_h((g - hbm_cap)*BLK + e + 1) = iand(g*131 + e, 1023)
+    end do
+  end do
+  istat = cudaHostGetDevicePointer(dp_host, hp_host, 0)
+  call c_f_pointer(dp_host, host_d, [host_cap*BLK])
+
+  ! spilled-directory mirror in host-mapped memory
+  istat = cudaHostAlloc(hp_ds, int(dir%nslots,c_size_t)*8_c_size_t, cudaHostAllocMapped)
+  istat = cudaHostAlloc(hp_dp, int(dir%nslots,c_size_t)*4_c_size_t, cudaHostAllocMapped)
+  call c_f_pointer(hp_ds, ds_h, [dir%nslots])
+  call c_f_pointer(hp_dp, dp_h, [dir%nslots])
+  istat = cudaMemcpy(ds_h, dir%store,   dir%nslots)   ! device -> host-mapped
+  istat = cudaMemcpy(dp_h, dir%payload, dir%nslots)
+  istat = cudaHostGetDevicePointer(dp_ds, hp_ds, 0)
+  istat = cudaHostGetDevicePointer(dp_dp, hp_dp, 0)
+  call c_f_pointer(dp_ds, ds_d, [dir%nslots])
+  call c_f_pointer(dp_dp, dp_d, [dir%nslots])
+
+  if (.not. csv) print '(a)', 'EXP 2 -- directory placement (50% HBM data residency):'
+
+  ! resident
+  best = 1.0e30
+  do e = 1, 3
+    d_hbmhit = 0
+    istat = cudaEventRecord(ev0, 0)
+    call gather<<<(Q+TT_TPB-1)/TT_TPB, TT_TPB>>>(dir%store, dir%nbkt, dir%B, dir%ovf_base, dir%ovf_cap, &
+          dir%payload, d_qbi, Q, d_hbm, hbm_cap, host_d, BLK, d_out, d_hbmhit)
+    istat = cudaEventRecord(ev1, 0); istat = cudaEventSynchronize(ev1)
+    istat = cudaEventElapsedTime(ms, ev0, ev1)
+    if (ms < best) best = ms
+  end do
+  mqps = real(Q) / (best * 1.0e3); gbps = real(Q)*hbytes/(best*1.0e6)
+  if (csv) then
+    print '(a,f0.2,a,f0.2)', 'PLACE,resident,', mqps, ',', gbps
+  else
+    print '(a,f11.2,a,f8.2,a)', '  directory resident (HBM): ', mqps, ' Mq/s  ', gbps, ' GB/s'
+  end if
+
+  ! spilled
+  best = 1.0e30
+  do e = 1, 3
+    d_hbmhit = 0
+    istat = cudaEventRecord(ev0, 0)
+    call gather<<<(Q+TT_TPB-1)/TT_TPB, TT_TPB>>>(ds_d, dir%nbkt, dir%B, dir%ovf_base, dir%ovf_cap, &
+          dp_d, d_qbi, Q, d_hbm, hbm_cap, host_d, BLK, d_out, d_hbmhit)
+    istat = cudaEventRecord(ev1, 0); istat = cudaEventSynchronize(ev1)
+    istat = cudaEventElapsedTime(ms, ev0, ev1)
+    if (ms < best) best = ms
+  end do
+  mqps = real(Q) / (best * 1.0e3); gbps = real(Q)*hbytes/(best*1.0e6)
+  if (csv) then
+    print '(a,f0.2,a,f0.2)', 'PLACE,spilled,', mqps, ',', gbps
+  else
+    print '(a,f11.2,a,f8.2,a)', '  directory spilled (host): ', mqps, ' Mq/s  ', gbps, ' GB/s'
+  end if
+
+  istat = cudaFreeHost(hp_host); istat = cudaFreeHost(hp_ds); istat = cudaFreeHost(hp_dp)
+  call tt_destroy(dir)
+end program kvpage

@@ -1,0 +1,385 @@
+! ============================================================================
+!  hashbench.cuf  --  Tiny Pointers vs. traditional open-addressing hashing
+!  on the GPU (CUDA Fortran / nvfortran).
+!
+!  Implements the "load-balancing dereference table" of
+!     Bender, Conway, Farach-Colton, Kuszmaul, Tagliavini,
+!     "Tiny Pointers", arXiv:2111.12800 (2021), Section 3.
+!  and benchmarks it head-to-head against a classic linear-probing
+!  open-addressing hash table.
+!
+!  KEY IDEA (the paper):
+!    * Traditional: to reference a slot you need an O(log n)-bit pointer,
+!      and to FIND a key you probe an unbounded sequence.
+!    * Tiny pointers: hash key k to a bucket of B slots; store k in any
+!      free slot j in that bucket. The "tiny pointer" is just j, which is
+!      log2(B) bits -- O(log log n) -- NOT log2(n) bits. DEREFERENCE(k,p)
+!      is the single slot  base(h(k)) + p : no search, no indirection.
+!    * Cost of tininess: a bucket can fill up, so a delta-fraction of
+!      ALLOCATEs may fail (paper's Lemma 1). We measure that failure rate.
+! ============================================================================
+
+module hashkernels
+  use cudafor
+  implicit none
+  integer, parameter :: EMPTY = -1
+  integer, parameter :: TPB   = 256   ! threads per block
+
+contains
+
+  ! --- 64-bit mixing hash, masked to a power-of-two range [0, n-1] --------
+  attributes(device) integer function hmix(key, n) result(h)
+    integer, value :: key
+    integer, value :: n            ! must be a power of two
+    integer(8) :: x
+    x = int(key, 8)
+    x = ieor(x, ishft(x, -16))
+    x = x * 2654435761_8
+    x = ieor(x, ishft(x, -13))
+    x = x * 2246822519_8
+    x = ieor(x, ishft(x, -16))
+    h = int(iand(x, int(n - 1, 8)))         ! ISHFT/iand: logical, sign-safe
+  end function hmix
+
+  ! ========================================================================
+  !  TRADITIONAL: linear-probing open-addressing hash table
+  ! ========================================================================
+  attributes(global) subroutine insert_lp(tab, cap, inkeys, nkeys)
+    integer, device :: tab(cap)
+    integer, value  :: cap, nkeys
+    integer, device :: inkeys(nkeys)
+    integer :: tid, k, h, i, slot, old
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > nkeys) return
+    k = inkeys(tid)
+    h = hmix(k, cap)
+    do i = 0, cap - 1
+      slot = iand(h + i, cap - 1)
+      old = atomiccas(tab(slot + 1), EMPTY, k)
+      if (old == EMPTY .or. old == k) return
+    end do
+  end subroutine insert_lp
+
+  ! lookup that probes; counts hits in 'found'
+  attributes(global) subroutine lookup_lp(tab, cap, qkeys, nq, found)
+    integer, device :: tab(cap)
+    integer, value  :: cap, nq
+    integer, device :: qkeys(nq)
+    integer, device :: found(1)
+    integer :: tid, k, h, i, slot, v, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > nq) return
+    k = qkeys(tid)
+    h = hmix(k, cap)
+    do i = 0, cap - 1
+      slot = iand(h + i, cap - 1)
+      v = tab(slot + 1)
+      if (v == k) then
+        istat = atomicadd(found(1), 1)
+        return
+      end if
+      if (v == EMPTY) return
+    end do
+  end subroutine lookup_lp
+
+  ! probe-length statistics for traditional lookups (untimed)
+  attributes(global) subroutine probestats_lp(tab, cap, qkeys, nq, probesum, probemax)
+    integer, device :: tab(cap)
+    integer, value  :: cap, nq
+    integer, device :: qkeys(nq)
+    integer(8), device :: probesum(1)
+    integer, device :: probemax(1)
+    integer :: tid, k, h, i, slot, v, istat, plen
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > nq) return
+    k = qkeys(tid)
+    h = hmix(k, cap)
+    do i = 0, cap - 1
+      slot = iand(h + i, cap - 1)
+      v = tab(slot + 1)
+      plen = i + 1
+      if (v == k .or. v == EMPTY) exit
+    end do
+    istat = atomicadd(probesum(1), int(plen, 8))
+    istat = atomicmax(probemax(1), plen)
+  end subroutine probestats_lp
+
+  ! ========================================================================
+  !  TINY POINTERS: load-balancing dereference table
+  !  store layout: nbkt buckets x B slots, slot global index = bkt*B + j
+  ! ========================================================================
+  attributes(global) subroutine insert_lb(store, nbkt, B, inkeys, nkeys, tinyptr, failc)
+    integer, value  :: nbkt, B, nkeys
+    integer, device :: store(nbkt * B)
+    integer, device :: inkeys(nkeys)
+    integer, device :: tinyptr(nkeys)        ! the tiny pointer: slot-in-bucket
+    integer, device :: failc(1)
+    integer :: tid, k, bkt, base, j, old, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > nkeys) return
+    k = inkeys(tid)
+    bkt = hmix(k, nbkt)
+    base = bkt * B
+    do j = 0, B - 1
+      old = atomiccas(store(base + j + 1), EMPTY, k)
+      if (old == EMPTY) then
+        tinyptr(tid) = j                     ! <-- log2(B) bits of information
+        return
+      end if
+      if (old == k) then
+        tinyptr(tid) = j
+        return
+      end if
+    end do
+    tinyptr(tid) = -1                        ! bucket full: ALLOCATE failed
+    istat = atomicadd(failc(1), 1)
+  end subroutine insert_lb
+
+  ! DEREFERENCE(k,p): direct O(1) single-access lookup using the tiny pointer
+  attributes(global) subroutine deref_lb(store, nbkt, B, qkeys, tinyptr, nq, found)
+    integer, value  :: nbkt, B, nq
+    integer, device :: store(nbkt * B)
+    integer, device :: qkeys(nq)
+    integer, device :: tinyptr(nq)
+    integer, device :: found(1)
+    integer :: tid, k, bkt, p, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > nq) return
+    p = tinyptr(tid)
+    if (p < 0) return                        ! was a failed allocation
+    k = qkeys(tid)
+    bkt = hmix(k, nbkt)
+    if (store(bkt * B + p + 1) == k) then     ! ONE memory access. no probe.
+      istat = atomicadd(found(1), 1)
+    end if
+  end subroutine deref_lb
+
+  ! lookup WITHOUT a stored hint: bounded scan of the B-slot bucket
+  ! (apples-to-apples vs. traditional "find key by searching")
+  attributes(global) subroutine scan_lb(store, nbkt, B, qkeys, nq, found)
+    integer, value  :: nbkt, B, nq
+    integer, device :: store(nbkt * B)
+    integer, device :: qkeys(nq)
+    integer, device :: found(1)
+    integer :: tid, k, bkt, base, j, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > nq) return
+    k = qkeys(tid)
+    bkt = hmix(k, nbkt)
+    base = bkt * B
+    do j = 0, B - 1
+      if (store(base + j + 1) == k) then
+        istat = atomicadd(found(1), 1)
+        return
+      end if
+    end do
+  end subroutine scan_lb
+
+  attributes(global) subroutine fill_empty(arr, n)
+    integer, device :: arr(n)
+    integer, value  :: n
+    integer :: tid
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid <= n) arr(tid) = EMPTY
+  end subroutine fill_empty
+
+end module hashkernels
+
+! ============================================================================
+program hashbench
+  use cudafor
+  use hashkernels
+  implicit none
+
+  integer :: log2cap, B, cap, nbkt, i, istat, narg
+  integer :: nkeys, blocks, fillblocks, rep
+  character(len=64) :: arg, arg3
+  logical :: csv
+  real :: lf
+  real, dimension(6) :: lfs = (/ 0.50, 0.70, 0.80, 0.90, 0.95, 0.99 /)
+
+  integer, allocatable :: h_keys(:)
+  integer, device, allocatable :: d_keys(:)
+  integer, device, allocatable :: d_tab(:)      ! traditional table
+  integer, device, allocatable :: d_store(:)    ! tiny-pointer store
+  integer, device, allocatable :: d_tiny(:)
+
+  integer, device :: d_found(1), d_fail(1), d_pmax(1)
+  integer(8), device :: d_psum(1)
+  integer :: found, fail, pmax
+  integer(8) :: psum
+  real :: avgprobe
+
+  type(cudaEvent) :: e0, e1
+  real :: ms, best_ins_lp, best_lk_lp, best_ins_lb, best_lk_deref, best_lk_scan
+  real :: mops_ins_lp, mops_lk_lp, mops_ins_lb, mops_deref, mops_scan
+  real :: bits_trad, bits_tiny
+
+  ! ---- args: log2(capacity)  bucketsize ----
+  log2cap = 22          ! default capacity = 4,194,304 slots
+  B       = 16          ! default bucket size -> tiny pointer = 4 bits
+  narg = command_argument_count()
+  if (narg >= 1) then
+    call get_command_argument(1, arg); read(arg,*) log2cap
+  end if
+  if (narg >= 2) then
+    call get_command_argument(2, arg); read(arg,*) B
+  end if
+  csv = .false.
+  if (narg >= 3) then
+    call get_command_argument(3, arg3); csv = (trim(arg3) == 'csv')
+  end if
+
+  cap  = ishft(1, log2cap)
+  nbkt = cap / B                       ! same total #slots for both tables
+  fillblocks = (cap + TPB - 1) / TPB
+
+  istat = cudaEventCreate(e0)
+  istat = cudaEventCreate(e1)
+
+  if (.not. csv) then
+    print '(a)', '==========================================================================='
+    print '(a)', '  Tiny Pointers (arXiv:2111.12800) vs. linear probing  --  CUDA Fortran'
+    print '(a,i0,a,i0,a)', '  capacity = 2^', log2cap, ' = ', cap, ' slots'
+    print '(a,i0,a,i0,a)', '  bucket size B = ', B, '  (tiny pointer = ', &
+          int(ceiling(log(real(B))/log(2.0))), ' bits)'
+    print '(a,i0,a)', '  traditional pointer width = ', log2cap, ' bits'
+    print '(a)', '==========================================================================='
+    print *
+  end if
+
+  bits_trad = real(log2cap)
+  bits_tiny = ceiling(log(real(B))/log(2.0))
+
+  allocate(d_tab(cap), d_store(nbkt * B))
+
+  ! header
+  if (csv) then
+    print '(a)', 'load,B,trad_ins,trad_lkup,avgprobe,maxprobe,tiny_ins,deref,scan,fail_pct,bits_trad,bits_tiny'
+  else
+    print '(a)', 'load |        TRADITIONAL (linear probing)        |          TINY POINTERS (load-balancing)'
+    print '(a)', '  %  |  ins Mops  lkup Mops  avgprobe  maxprobe   |  ins Mops  deref Mops  scan Mops   alloc-fail%'
+    print '(a)', '-----+--------------------------------------------+------------------------------------------------'
+  end if
+
+  do i = 1, size(lfs)
+    lf = lfs(i)
+    nkeys = int(lf * real(cap))
+    blocks = (nkeys + TPB - 1) / TPB
+
+    ! generate keys on host: distinct values 1..nkeys (the hash mixes them)
+    if (allocated(h_keys)) deallocate(h_keys)
+    allocate(h_keys(nkeys))
+    do rep = 1, nkeys
+      h_keys(rep) = rep
+    end do
+    if (allocated(d_keys)) deallocate(d_keys)
+    if (allocated(d_tiny)) deallocate(d_tiny)
+    allocate(d_keys(nkeys), d_tiny(nkeys))
+    d_keys = h_keys
+
+    ! =================== TRADITIONAL: insert (timed, best of 3) ===========
+    best_ins_lp = 1.0e30
+    do rep = 1, 3
+      call fill_empty<<<fillblocks, TPB>>>(d_tab, cap)
+      istat = cudaDeviceSynchronize()
+      istat = cudaEventRecord(e0, 0)
+      call insert_lp<<<blocks, TPB>>>(d_tab, cap, d_keys, nkeys)
+      istat = cudaEventRecord(e1, 0)
+      istat = cudaEventSynchronize(e1)
+      istat = cudaEventElapsedTime(ms, e0, e1)
+      if (ms < best_ins_lp) best_ins_lp = ms
+    end do
+    ! (d_tab now holds the final populated table)
+
+    ! traditional lookup (timed)
+    best_lk_lp = 1.0e30
+    do rep = 1, 3
+      d_found = 0
+      istat = cudaEventRecord(e0, 0)
+      call lookup_lp<<<blocks, TPB>>>(d_tab, cap, d_keys, nkeys, d_found)
+      istat = cudaEventRecord(e1, 0)
+      istat = cudaEventSynchronize(e1)
+      istat = cudaEventElapsedTime(ms, e0, e1)
+      if (ms < best_lk_lp) best_lk_lp = ms
+    end do
+    found = d_found(1)
+
+    ! probe stats (untimed)
+    d_psum = 0_8; d_pmax = 0
+    call probestats_lp<<<blocks, TPB>>>(d_tab, cap, d_keys, nkeys, d_psum, d_pmax)
+    istat = cudaDeviceSynchronize()
+    psum = d_psum(1); pmax = d_pmax(1)
+    avgprobe = real(psum) / real(nkeys)
+
+    mops_ins_lp = real(nkeys) / (best_ins_lp * 1.0e3)
+    mops_lk_lp  = real(nkeys) / (best_lk_lp  * 1.0e3)
+
+    ! =================== TINY POINTERS: insert (timed, best of 3) =========
+    best_ins_lb = 1.0e30
+    fail = 0
+    do rep = 1, 3
+      call fill_empty<<<(nbkt*B+TPB-1)/TPB, TPB>>>(d_store, nbkt*B)
+      d_fail = 0
+      istat = cudaDeviceSynchronize()
+      istat = cudaEventRecord(e0, 0)
+      call insert_lb<<<blocks, TPB>>>(d_store, nbkt, B, d_keys, nkeys, d_tiny, d_fail)
+      istat = cudaEventRecord(e1, 0)
+      istat = cudaEventSynchronize(e1)
+      istat = cudaEventElapsedTime(ms, e0, e1)
+      if (ms < best_ins_lb) best_ins_lb = ms
+    end do
+    fail = d_fail(1)
+
+    ! DEREFERENCE via tiny pointer hint (timed) -- single access
+    best_lk_deref = 1.0e30
+    do rep = 1, 3
+      d_found = 0
+      istat = cudaEventRecord(e0, 0)
+      call deref_lb<<<blocks, TPB>>>(d_store, nbkt, B, d_keys, d_tiny, nkeys, d_found)
+      istat = cudaEventRecord(e1, 0)
+      istat = cudaEventSynchronize(e1)
+      istat = cudaEventElapsedTime(ms, e0, e1)
+      if (ms < best_lk_deref) best_lk_deref = ms
+    end do
+
+    ! bucket scan (no hint) (timed)
+    best_lk_scan = 1.0e30
+    do rep = 1, 3
+      d_found = 0
+      istat = cudaEventRecord(e0, 0)
+      call scan_lb<<<blocks, TPB>>>(d_store, nbkt, B, d_keys, nkeys, d_found)
+      istat = cudaEventRecord(e1, 0)
+      istat = cudaEventSynchronize(e1)
+      istat = cudaEventElapsedTime(ms, e0, e1)
+      if (ms < best_lk_scan) best_lk_scan = ms
+    end do
+
+    mops_ins_lb = real(nkeys) / (best_ins_lb   * 1.0e3)
+    mops_deref  = real(nkeys) / (best_lk_deref * 1.0e3)
+    mops_scan   = real(nkeys) / (best_lk_scan  * 1.0e3)
+
+    if (csv) then
+      print '(f6.4,a,i0,a,f0.2,a,f0.2,a,f0.4,a,i0,a,f0.2,a,f0.2,a,f0.2,a,f0.5,a,f0.1,a,f0.1)', &
+          lf, ',', B, ',', mops_ins_lp, ',', mops_lk_lp, ',', avgprobe, ',', pmax, ',', &
+          mops_ins_lb, ',', mops_deref, ',', mops_scan, ',', &
+          100.0*real(fail)/real(nkeys), ',', bits_trad, ',', bits_tiny
+    else
+      print '(f5.2,a,f9.1,f10.1,f10.2,i10,a,f9.1,f11.1,f10.1,f12.3)', &
+          lf*100.0, ' |', mops_ins_lp, mops_lk_lp, avgprobe, pmax, '   |', &
+          mops_ins_lb, mops_deref, mops_scan, 100.0*real(fail)/real(nkeys)
+    end if
+  end do
+
+  if (.not. csv) then
+    print *
+    print '(a)', 'Space per external reference (the headline result of the paper):'
+    print '(a,f5.1,a)', '  traditional pointer : ', bits_trad, ' bits/key'
+    print '(a,f5.1,a,f6.1,a)', '  tiny pointer        : ', bits_tiny, ' bits/key  ( ', &
+          bits_trad/bits_tiny, 'x smaller )'
+  end if
+
+  deallocate(d_tab, d_store)
+  if (allocated(d_keys)) deallocate(d_keys)
+  if (allocated(d_tiny)) deallocate(d_tiny)
+end program hashbench

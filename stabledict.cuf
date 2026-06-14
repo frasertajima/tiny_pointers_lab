@@ -1,0 +1,195 @@
+! ============================================================================
+!  stabledict.cuf -- application #3: a space-efficient STABLE dictionary.
+!
+!  "Stable" = once a key is inserted, the cell holding its value NEVER moves,
+!  no matter what else is inserted later. That lets you hand out the key's
+!  tiny pointer as a DURABLE HANDLE -- a foreign key, a GPU object handle, an
+!  index another structure points into -- and trust it forever.
+!
+!  The felt difference:
+!    * Tiny-pointer table (reliable 2-level, from tinymap): pre-sized with
+!      headroom; an insert claims a slot and that slot is permanent. Growth
+!      touches only empty cells. -> 100% of old handles stay valid.
+!    * Conventional open-addressing (linear probing): to accept growth past its
+!      load limit it must RESIZE -> rehash every key into a bigger table ->
+!      every previously-issued address becomes stale. -> ~0% of old handles
+!      survive (and you'd have to chase and rewrite every external pointer).
+!
+!  Plus the handle WIDTH: tiny pointer = log2(B) bits vs a full pointer = log2(n).
+!
+!  Output (CSV):
+!    STABLE,<N0>,<N1>,<tiny_stable_pct>,<lp_stable_pct>,<tiny_handle_bits>,<full_handle_bits>
+! ============================================================================
+
+module stbk
+  use cudafor
+  use tinymap
+  implicit none
+  integer, parameter :: SPB = 256
+contains
+
+  ! insert a batch into the reliable tiny table, recording each key's slot
+  attributes(global) subroutine ins_r_rec(store, nbkt, B, ovf_base, ovf_cap, &
+                                           keys, n, slots, failc)
+    integer(8), device :: store(*), keys(n)
+    integer,    device :: slots(n), failc(1)
+    integer,    value  :: nbkt, B, ovf_base, ovf_cap, n
+    integer :: tid, s, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > n) return
+    s = ttd_insert_r(store, nbkt, B, ovf_base, ovf_cap, keys(tid))
+    slots(tid) = s
+    if (s < 0) then; istat = atomicadd(failc(1), 1); end if
+  end subroutine ins_r_rec
+
+  ! re-find a batch and count how many land on their ORIGINAL recorded slot
+  attributes(global) subroutine find_r_stable(store, nbkt, B, ovf_base, ovf_cap, &
+                                               keys, n, oldslots, stablec)
+    integer(8), device :: store(*), keys(n)
+    integer,    device :: oldslots(n), stablec(1)
+    integer,    value  :: nbkt, B, ovf_base, ovf_cap, n
+    integer :: tid, s, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > n) return
+    s = ttd_find_r(store, nbkt, B, ovf_base, ovf_cap, keys(tid))
+    if (s >= 0 .and. s == oldslots(tid)) istat = atomicadd(stablec(1), 1)
+  end subroutine find_r_stable
+
+  ! linear-probe insert recording slots
+  attributes(global) subroutine ins_lp_rec(store, cap, keys, n, slots, failc)
+    integer(8), device :: store(*), keys(n)
+    integer,    device :: slots(n), failc(1)
+    integer,    value  :: cap, n
+    integer :: tid, s, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > n) return
+    s = lpd_insert(store, cap, keys(tid))
+    slots(tid) = s
+    if (s < 0) then; istat = atomicadd(failc(1), 1); end if
+  end subroutine ins_lp_rec
+
+  ! after a RESIZE+rehash, count old keys still on their old (pre-resize) slot
+  attributes(global) subroutine find_lp_stable(store, cap, keys, n, oldslots, stablec)
+    integer(8), device :: store(*), keys(n)
+    integer,    device :: oldslots(n), stablec(1)
+    integer,    value  :: cap, n
+    integer :: tid, s, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > n) return
+    s = lpd_find(store, cap, keys(tid))
+    if (s >= 0 .and. s == oldslots(tid)) istat = atomicadd(stablec(1), 1)
+  end subroutine find_lp_stable
+
+  attributes(global) subroutine fill_empty(store, n)
+    integer(8), device :: store(n)
+    integer,    value  :: n
+    integer :: tid
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid <= n) store(tid) = -1_8
+  end subroutine fill_empty
+end module stbk
+
+! ============================================================================
+program stabledict
+  use cudafor
+  use tinymap
+  use stbk
+  implicit none
+
+  integer :: N0, N1, i, istat, narg, B
+  real    :: load
+  character(len=64) :: arg
+
+  integer(8), allocatable :: h_k0(:), h_k1(:)
+  integer(8), device, allocatable :: d_k0(:), d_k1(:)
+  integer,    device, allocatable :: d_slot0(:), d_scratch(:), d_fail(:), d_stable(:)
+
+  type(tiny_map) :: map
+  integer :: blocks0, blocks1, tiny_stable, fails
+  real :: tiny_pct, lp_pct, tinybits, fullbits
+
+  ! linear-probe baseline state
+  integer :: cap0, cap1
+  integer(8), device, allocatable :: lp0(:), lp1(:)
+  integer,    device, allocatable :: lp_old(:), lp_new(:)
+  integer :: lp_stable
+
+  N0   = ishft(1, 20)        ! initial population
+  N1   = ishft(1, 20)        ! growth (doubles the table)
+  B    = 16
+  load = 0.90
+  narg = command_argument_count()
+  if (narg >= 1) then; call get_command_argument(1, arg); read(arg,*) N0; end if
+  if (narg >= 2) then; call get_command_argument(2, arg); read(arg,*) N1; end if
+
+  ! distinct keys: initial vs growth (arbitrary distinct ids, well spread)
+  allocate(h_k0(N0), h_k1(N1))
+  do i = 1, N0; h_k0(i) = int(i, 8) * 1000003_8;       end do
+  do i = 1, N1; h_k1(i) = int(N0 + i, 8) * 1000003_8;  end do
+  allocate(d_k0(N0), d_k1(N1), d_slot0(N0), d_scratch(N1), d_fail(1), d_stable(1))
+  d_k0 = h_k0; d_k1 = h_k1
+  blocks0 = (N0 + SPB - 1) / SPB
+  blocks1 = (N1 + SPB - 1) / SPB
+
+  print '(a)', '# stabledict: durable handles under growth (tiny vs resize)'
+  print '(a,i0,a,i0,a,i0,a,f0.2)', '# N0=', N0, '  N1(growth)=', N1, '  B=', B, '  load=', load
+
+  ! ===================== TINY-POINTER reliable table =====================
+  ! Size ONCE for the final population (N0+N1) with headroom -> NO resize ever.
+  call tt_create_r(map, N0 + N1, B, load, 0.15)
+  d_fail = 0
+  ! (1) insert the initial population, recording each key's permanent slot
+  call ins_r_rec<<<blocks0, SPB>>>(map%store, map%nbkt, map%B, map%ovf_base, &
+                                   map%ovf_cap, d_k0, N0, d_slot0, d_fail)
+  istat = cudaDeviceSynchronize()
+  ! (2) GROW: insert N1 more keys into the SAME table (touches only empty cells)
+  call ins_r_rec<<<blocks1, SPB>>>(map%store, map%nbkt, map%B, map%ovf_base, &
+                                   map%ovf_cap, d_k1, N1, d_scratch, d_fail)
+  istat = cudaDeviceSynchronize()
+  fails = d_fail(1)
+  ! (3) re-find the ORIGINAL N0 keys; their slots must be unchanged
+  d_stable = 0
+  call find_r_stable<<<blocks0, SPB>>>(map%store, map%nbkt, map%B, map%ovf_base, &
+                                       map%ovf_cap, d_k0, N0, d_slot0, d_stable)
+  istat = cudaDeviceSynchronize()
+  tiny_stable = d_stable(1)
+  tiny_pct = 100.0 * real(tiny_stable) / real(N0)
+
+  ! ===================== LINEAR-PROBE baseline (must resize) =============
+  ! (1) build the initial table at cap0 and record the original slots
+  cap0 = int(ceiling(real(N0) / load))
+  allocate(lp0(cap0), lp_old(N0))
+  call fill_empty<<<(cap0+SPB-1)/SPB, SPB>>>(lp0, cap0)
+  istat = cudaDeviceSynchronize()
+  d_fail = 0
+  call ins_lp_rec<<<blocks0, SPB>>>(lp0, cap0, d_k0, N0, lp_old, d_fail)
+  istat = cudaDeviceSynchronize()
+  ! (2) GROW past capacity -> a bigger table at cap1 and REHASH everything
+  cap1 = int(ceiling(real(N0 + N1) / load))
+  allocate(lp1(cap1), lp_new(N0))
+  call fill_empty<<<(cap1+SPB-1)/SPB, SPB>>>(lp1, cap1)
+  istat = cudaDeviceSynchronize()
+  d_fail = 0
+  call ins_lp_rec<<<blocks0, SPB>>>(lp1, cap1, d_k0, N0, lp_new, d_fail)   ! rehash old
+  call ins_lp_rec<<<blocks1, SPB>>>(lp1, cap1, d_k1, N1, d_scratch, d_fail)! plus growth
+  istat = cudaDeviceSynchronize()
+  ! (3) how many original keys kept their old slot after the resize? (~none)
+  d_stable = 0
+  call find_lp_stable<<<blocks0, SPB>>>(lp1, cap1, d_k0, N0, lp_old, d_stable)
+  istat = cudaDeviceSynchronize()
+  lp_stable = d_stable(1)
+  lp_pct = 100.0 * real(lp_stable) / real(N0)
+
+  ! ===================== handle width & report ===========================
+  tinybits = ceiling(log(real(B)) / log(2.0))             ! slot within bucket
+  fullbits = ceiling(log(real(map%nslots)) / log(2.0))    ! full pointer
+
+  print '(a,i0,a,i0)', '# tiny: original handles still valid = ', tiny_stable, ' / ', N0
+  print '(a,i0,a,i0,a,i0)', '# tiny build failures = ', fails, &
+        '   LP: original handles still valid after resize = ', lp_stable, ' / ', N0
+  print '(a,i0,a,i0,a,f0.1,a,f0.1,a,f0.0,a,f0.0)', &
+        'STABLE,', N0, ',', N1, ',', tiny_pct, ',', lp_pct, ',', tinybits, ',', fullbits
+
+  call tt_destroy(map)
+  deallocate(d_k0, d_k1, d_slot0, d_scratch, d_fail, d_stable, lp0, lp1, lp_old, lp_new)
+end program stabledict

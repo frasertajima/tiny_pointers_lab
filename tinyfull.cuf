@@ -1,0 +1,245 @@
+! ============================================================================
+!  tinyfull.cuf -- full tiny-pointer demo: the two extensions
+!
+!   (1) RECURSIVE / MULTI-LEVEL dereference table.
+!       The single-level load-balancing table fails on a delta-fraction of
+!       allocations (a full bucket). The paper routes those to a backup table,
+!       recursively. We implement up to MAXLEV levels: level L catches the
+!       overflow of level L-1. Each level runs at per-level load ~PLOAD, so the
+!       residual failure fraction shrinks geometrically -> hits ZERO, while the
+!       overall table still reaches a high load factor (1 - o(1)).
+!       The tiny pointer becomes (level, slot-in-bucket): log2(MAXLEV)+log2(B)
+!       bits -- still O(log log n).
+!
+!   (2) RELAXED RETRIEVAL (key-less value store).
+!       The store holds VALUES, not keys. Occupancy is a separate bit-array used
+!       only to claim slots at insert time. DEREFERENCE returns the value via
+!       the (level,slot) hint with NO key comparison and NO probing -- truly
+!       indirection-less. We verify correctness with a checksum.
+!
+!  Output: CSV lines prefixed with a tag so a notebook can parse them:
+!     LEVEL,<L>,<remaining_before>,<placed_this_level>,<residual_pct>,<cum_slots>,<cum_load>
+!     DEREF,<deref_Mops>,<checksum_ok(1/0)>,<tinyptr_bits>,<trad_bits>
+! ============================================================================
+
+module tinykernels
+  use cudafor
+  implicit none
+  integer, parameter :: TPB = 256
+
+contains
+
+  ! mixing hash modulo an ARBITRARY bucket count (levels aren't powers of two)
+  attributes(device) integer function hmod(key, n) result(h)
+    integer, value :: key, n
+    integer(8) :: x
+    x = int(key, 8)
+    x = ieor(x, ishft(x, -16))
+    x = x * 2654435761_8
+    x = ieor(x, ishft(x, -13))
+    x = x * 2246822519_8
+    x = ieor(x, ishft(x, -16))
+    x = iand(x, 9223372036854775807_8)          ! clear sign bit -> nonneg
+    h = int(mod(x, int(n, 8)))
+  end function hmod
+
+  ! Insert all still-unplaced keys into level L.
+  !   occ/valstore are the single shared arenas; this level owns
+  !   slots [base .. base + nbkt*B - 1].
+  attributes(global) subroutine insert_level(keys, vals, nkeys, lvl, base, nbkt, B, &
+                                              occ, valstore, levelof, slotof)
+    integer, value  :: nkeys, lvl, base, nbkt, B
+    integer, device :: keys(nkeys), vals(nkeys)
+    integer, device :: occ(*), valstore(*)
+    integer, device :: levelof(nkeys), slotof(nkeys)
+    integer :: tid, k, bkt, j, gslot, old
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > nkeys) return
+    if (levelof(tid) >= 0) return                 ! already placed at a lower level
+    k = keys(tid)
+    bkt = hmod(k, nbkt)
+    do j = 0, B - 1
+      gslot = base + bkt * B + j
+      old = atomiccas(occ(gslot + 1), 0, 1)       ! claim the slot
+      if (old == 0) then
+        valstore(gslot + 1) = vals(tid)           ! store VALUE only (no key)
+        levelof(tid) = lvl
+        slotof(tid)  = j
+        return
+      end if
+    end do
+    ! still unplaced -> overflows to the next level
+  end subroutine insert_level
+
+  attributes(global) subroutine count_unplaced(levelof, nkeys, cnt)
+    integer, value  :: nkeys
+    integer, device :: levelof(nkeys), cnt(1)
+    integer :: tid, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > nkeys) return
+    if (levelof(tid) < 0) istat = atomicadd(cnt(1), 1)
+  end subroutine count_unplaced
+
+  ! RELAXED RETRIEVAL: recover the value from the (level, slot) tiny pointer.
+  ! per-level base/nbkt are passed in small device arrays. No key compare.
+  attributes(global) subroutine deref_relaxed(keys, nkeys, levelof, slotof, &
+                                              baseL, nbktL, B, valstore, chk)
+    integer, value  :: nkeys, B
+    integer, device :: keys(nkeys), levelof(nkeys), slotof(nkeys)
+    integer, device :: baseL(*), nbktL(*), valstore(*)
+    integer(8), device :: chk(1)
+    integer :: tid, k, L, base, nbkt, bkt, gslot, v, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > nkeys) return
+    L = levelof(tid)
+    if (L < 0) return
+    base = baseL(L + 1)
+    nbkt = nbktL(L + 1)
+    k = keys(tid)
+    bkt = hmod(k, nbkt)
+    gslot = base + bkt * B + slotof(tid)          ! ONE access, no probe, no key
+    v = valstore(gslot + 1)
+    istat = atomicadd(chk(1), int(v, 8))
+  end subroutine deref_relaxed
+
+  attributes(global) subroutine zero_i(a, n)
+    integer, device :: a(*)
+    integer, value  :: n
+    integer :: tid
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid <= n) a(tid) = 0
+  end subroutine zero_i
+
+  attributes(global) subroutine set_neg(a, n)
+    integer, device :: a(*)
+    integer, value  :: n
+    integer :: tid
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid <= n) a(tid) = -1
+  end subroutine set_neg
+
+end module tinykernels
+
+! ============================================================================
+program tinyfull
+  use cudafor
+  use tinykernels
+  implicit none
+
+  integer, parameter :: MAXLEV = 12
+  integer :: log2n, B, nkeys, i, istat, narg, blocks, L
+  integer :: nbkt, base, remaining, placed, cum_slots, arena, lvblocks, ncnt
+  real    :: pload
+  character(len=64) :: arg
+
+  integer, allocatable :: h_keys(:), h_vals(:)
+  integer, device, allocatable :: d_keys(:), d_vals(:)
+  integer, device, allocatable :: d_level(:), d_slot(:)
+  integer, device, allocatable :: d_occ(:), d_val(:)
+  integer, device, allocatable :: d_baseL(:), d_nbktL(:)
+  integer :: h_baseL(MAXLEV), h_nbktL(MAXLEV)
+  integer, device, allocatable :: d_cnt(:)
+  integer(8), device, allocatable :: d_chk(:)
+  integer(8) :: chk_dev, chk_host
+
+  type(cudaEvent) :: e0, e1
+  real :: ms, best, mops, tinybits, tradbits, cumload
+  integer :: chk_ok
+
+  log2n = 22
+  B     = 16
+  pload = 0.90
+  narg = command_argument_count()
+  if (narg >= 1) then; call get_command_argument(1, arg); read(arg,*) log2n; end if
+  if (narg >= 2) then; call get_command_argument(2, arg); read(arg,*) B;     end if
+  if (narg >= 3) then; call get_command_argument(3, arg); read(arg,*) pload; end if
+
+  nkeys = ishft(1, log2n)
+  arena = int(real(nkeys) * 2.0)               ! generous shared slot arena
+  blocks = (nkeys + TPB - 1) / TPB
+
+  istat = cudaEventCreate(e0); istat = cudaEventCreate(e1)
+
+  allocate(h_keys(nkeys), h_vals(nkeys))
+  do i = 1, nkeys
+    h_keys(i) = i
+    h_vals(i) = int(iand(int(i,8) * 2654435761_8, 2147483647_8))  ! arbitrary payload
+  end do
+  chk_host = 0_8
+  do i = 1, nkeys
+    chk_host = chk_host + int(h_vals(i), 8)
+  end do
+
+  allocate(d_keys(nkeys), d_vals(nkeys), d_level(nkeys), d_slot(nkeys))
+  allocate(d_occ(arena), d_val(arena))
+  allocate(d_baseL(MAXLEV), d_nbktL(MAXLEV), d_cnt(1), d_chk(1))
+  d_keys = h_keys; d_vals = h_vals
+
+  call zero_i<<<(arena+TPB-1)/TPB, TPB>>>(d_occ, arena)
+  call set_neg<<<blocks, TPB>>>(d_level, nkeys)
+  call set_neg<<<blocks, TPB>>>(d_slot,  nkeys)
+  istat = cudaDeviceSynchronize()
+
+  print '(a)', '# tinyfull: multi-level dereference table + relaxed retrieval'
+  print '(a,i0,a,i0,a,f0.2)', '# keys=2^', log2n, '  B=', B, '  per-level load=', pload
+  print '(a)', 'tag,level,remaining_before,placed,residual_pct,cum_slots,cum_load'
+
+  remaining = nkeys
+  cum_slots = 0
+  base = 0
+  h_baseL = 0; h_nbktL = 1
+  L = 0
+  do while (remaining > 0 .and. L < MAXLEV)
+    ! size this level to hold the current overflow at the target per-level load
+    nbkt = max(1, int(ceiling(real(remaining) / (real(B) * pload))))
+    if (base + nbkt * B > arena) nbkt = max(1, (arena - base) / B)   ! safety clamp
+    h_baseL(L+1) = base
+    h_nbktL(L+1) = nbkt
+
+    call insert_level<<<blocks, TPB>>>(d_keys, d_vals, nkeys, L, base, nbkt, B, &
+                                       d_occ, d_val, d_level, d_slot)
+    istat = cudaDeviceSynchronize()
+
+    d_cnt = 0
+    call count_unplaced<<<blocks, TPB>>>(d_level, nkeys, d_cnt)
+    istat = cudaDeviceSynchronize()
+    ncnt = d_cnt(1)                                ! copy device scalar -> host
+    placed = remaining - ncnt
+    cum_slots = cum_slots + nbkt * B
+    cumload = real(nkeys) / real(cum_slots)
+    print '(a,i0,a,i0,a,i0,a,f0.6,a,i0,a,f0.4)', 'LEVEL,', L, ',', remaining, ',', &
+        placed, ',', 100.0*real(ncnt)/real(nkeys), ',', cum_slots, ',', cumload
+
+    remaining = ncnt
+    base = base + nbkt * B
+    L = L + 1
+  end do
+
+  d_baseL = h_baseL; d_nbktL = h_nbktL
+
+  ! ---- relaxed retrieval: timed deref + correctness checksum ----
+  best = 1.0e30
+  do i = 1, 5
+    d_chk = 0_8
+    istat = cudaEventRecord(e0, 0)
+    call deref_relaxed<<<blocks, TPB>>>(d_keys, nkeys, d_level, d_slot, &
+                                        d_baseL, d_nbktL, B, d_val, d_chk)
+    istat = cudaEventRecord(e1, 0)
+    istat = cudaEventSynchronize(e1)
+    istat = cudaEventElapsedTime(ms, e0, e1)
+    if (ms < best) best = ms
+  end do
+  chk_dev = d_chk(1)
+  chk_ok = 0
+  if (chk_dev == chk_host) chk_ok = 1
+  mops = real(nkeys) / (best * 1.0e3)
+
+  tinybits = ceiling(log(real(L))/log(2.0)) + ceiling(log(real(B))/log(2.0))
+  tradbits = real(log2n)
+
+  print '(a,f0.2,a,i0,a,f0.1,a,f0.1)', 'DEREF,', mops, ',', chk_ok, ',', tinybits, ',', tradbits
+  print '(a,i0,a,f0.6)', '# levels used=', L, '  final residual=', 100.0*real(remaining)/real(nkeys)
+  print '(a,i0,a,i0)', '# checksum dev=', chk_dev, '  host=', chk_host
+
+  deallocate(d_keys, d_vals, d_level, d_slot, d_occ, d_val)
+end program tinyfull

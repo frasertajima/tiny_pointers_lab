@@ -1,0 +1,225 @@
+! ============================================================================
+!  succinctbst.cuf -- application #5: a SUCCINCT binary search tree.
+!
+!  A pointer-based BST node stores key + two child pointers of log2(n) bits
+!  each. For a billion-node tree that is ~16 GB of nothing but pointers.
+!
+!  The tiny-pointer idea (arXiv:2111.12800, succinct trees): give every node an
+!  identity that the parent can RECOMPUTE -- here the heap path-id (root=1,
+!  left child of p = 2p, right child = 2p+1). The child's storage cell is then
+!  hash(child_id) mod M plus a small DISPLACEMENT. The parent stores only that
+!  displacement -- the tiny pointer -- log2(maxdisp) bits, not log2(n).
+!
+!  DEREFERENCE(child_id, disp) = (hash(child_id) + disp) mod M  -- one access,
+!  no probing at query time. This is exactly the paper's hash*B + p, with the
+!  "bucket" being the home cell and the tiny pointer being the probe distance
+!  that finished placement at build time. Lossless by construction (it is just
+!  open addressing whose displacement we remembered).
+!
+!  Output (CSV, parsed by the notebook):
+!    BST,<N>,<load>,<M>,<maxdisp>,<tiny_bits_per_child>,<full_bits_per_child>,<found_ok>,<mq_s>
+! ============================================================================
+
+module sbstk
+  use cudafor
+  implicit none
+  integer, parameter :: TPB = 256
+  integer(8), parameter :: EMPTYK = -1_8
+
+contains
+
+  ! murmur3 fmix64 on a 64-bit path-id -> nonnegative 64-bit hash
+  attributes(device) integer(8) function hmix64_d(key) result(x)
+    integer(8), value :: key
+    x = key
+    x = ieor(x, ishft(x, -33))
+    x = x * (-49064778989728563_8)
+    x = ieor(x, ishft(x, -33))
+    x = x * (-4265267296055464365_8)
+    x = ieor(x, ishft(x, -33))
+    x = iand(x, 9223372036854775807_8)
+  end function hmix64_d
+
+  ! Parallel BST search: every thread walks root->leaf using tiny-pointer
+  ! derefs only. No full pointers are ever read.
+  attributes(global) subroutine bst_search(nkey, nval, ldisp, rdisp, M, &
+                                            rootidx, qk, nq, fcnt, chk)
+    integer(8), device :: nkey(M), qk(nq)
+    integer,    device :: nval(M), ldisp(M), rdisp(M)
+    integer,    value  :: M, rootidx, nq
+    integer,    device :: fcnt(1)
+    integer(8), device :: chk(1)
+    integer :: tid, idx, d, step, istat
+    integer(8) :: p, child, k, target
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > nq) return
+    target = qk(tid)
+    idx = rootidx
+    p   = 1_8
+    do step = 1, 64                       ! bounded by tree height
+      k = nkey(idx + 1)
+      if (k == target) then
+        istat = atomicadd(fcnt(1), 1)
+        istat = atomicadd(chk(1), int(nval(idx + 1), 8))
+        return
+      end if
+      if (target < k) then
+        d = ldisp(idx + 1)
+        if (d < 0) return                  ! absent
+        child = 2_8 * p
+      else
+        d = rdisp(idx + 1)
+        if (d < 0) return                  ! absent
+        child = 2_8 * p + 1_8
+      end if
+      idx = int(mod(hmix64_d(child) + int(d, 8), int(M, 8)))   ! DEREFERENCE
+      p   = child
+    end do
+  end subroutine bst_search
+
+end module sbstk
+
+! ============================================================================
+program succinctbst
+  use cudafor
+  use sbstk
+  implicit none
+
+  integer :: N, M, i, istat, narg, blocks, nq, rootidx, maxdisp
+  real    :: load
+  character(len=64) :: arg
+
+  ! host arena (one cell per node, open-addressed by path-id)
+  integer(8), allocatable :: h_nkey(:)
+  integer,    allocatable :: h_nval(:), h_ldisp(:), h_rdisp(:), h_occ(:)
+  ! queries
+  integer(8), allocatable :: h_qk(:)
+  integer :: should_find
+  integer(8) :: chk_host
+
+  integer(8), device, allocatable :: d_nkey(:), d_qk(:), d_chk(:)
+  integer,    device, allocatable :: d_nval(:), d_ldisp(:), d_rdisp(:), d_fcnt(:)
+  integer(8) :: chk_dev
+  integer    :: found_dev, found_ok
+  type(cudaEvent) :: e0, e1
+  real :: ms, best, mq, tinybits, fullbits
+
+  N    = ishft(1, 20)
+  load = 0.70
+  narg = command_argument_count()
+  if (narg >= 1) then; call get_command_argument(1, arg); read(arg,*) N;    end if
+  if (narg >= 2) then; call get_command_argument(2, arg); read(arg,*) load; end if
+
+  M = int(ceiling(real(N) / load))
+  allocate(h_nkey(M), h_nval(M), h_ldisp(M), h_rdisp(M), h_occ(M))
+  h_nkey = EMPTYK; h_nval = 0; h_ldisp = -1; h_rdisp = -1; h_occ = 0
+  maxdisp = 0
+
+  ! keys 1..N (sorted) -> balanced BST so height = log2(N). value = payload.
+  ! Build places every node and records the parent's tiny pointer (= displ).
+  ! Root is placed first into an empty table, so its displacement is 0 and its
+  ! cell index is simply home(path-id 1).
+  i = place_build(1, N, 1_8)
+  rootidx = int(mod(hmix64_h(1_8), int(M, 8)))
+
+  print '(a)', '# succinctbst: succinct BST with tiny child pointers'
+  print '(a,i0,a,f0.2,a,i0,a,i0)', '# N=', N, '  load=', load, '  M=', M, '  maxdisp=', maxdisp
+
+  ! ---- queries: half present, half absent (key > N) ----
+  nq = N
+  allocate(h_qk(nq))
+  should_find = 0
+  chk_host = 0_8
+  do i = 1, nq
+    if (iand(i, 1) == 0) then
+      h_qk(i) = int(i, 8)                       ! present
+      should_find = should_find + 1
+      chk_host = chk_host + int(payload(i), 8)
+    else
+      h_qk(i) = int(N, 8) + int(i, 8)           ! absent
+    end if
+  end do
+
+  allocate(d_nkey(M), d_nval(M), d_ldisp(M), d_rdisp(M))
+  allocate(d_qk(nq), d_fcnt(1), d_chk(1))
+  d_nkey = h_nkey; d_nval = h_nval; d_ldisp = h_ldisp; d_rdisp = h_rdisp
+  d_qk = h_qk
+
+  istat = cudaEventCreate(e0); istat = cudaEventCreate(e1)
+  blocks = (nq + TPB - 1) / TPB
+  best = 1.0e30
+  do i = 1, 5
+    d_fcnt = 0; d_chk = 0_8
+    istat = cudaEventRecord(e0, 0)
+    call bst_search<<<blocks, TPB>>>(d_nkey, d_nval, d_ldisp, d_rdisp, M, &
+                                     rootidx, d_qk, nq, d_fcnt, d_chk)
+    istat = cudaEventRecord(e1, 0)
+    istat = cudaEventSynchronize(e1)
+    istat = cudaEventElapsedTime(ms, e0, e1)
+    if (ms < best) best = ms
+  end do
+  found_dev = d_fcnt(1)
+  chk_dev   = d_chk(1)
+  mq = real(nq) / (best * 1.0e3)
+
+  found_ok = 0
+  if (found_dev == should_find .and. chk_dev == chk_host) found_ok = 1
+
+  tinybits = ceiling(log(real(maxdisp + 1)) / log(2.0))
+  fullbits = ceiling(log(real(M)) / log(2.0))
+
+  print '(a,i0,a,i0,a,i0)', '# found=', found_dev, ' / should=', should_find, &
+        '  found_ok=', found_ok
+  print '(a,i0,a,f0.2,a,i0,a,i0,a,f0.0,a,f0.0,a,i0,a,f0.2)', &
+        'BST,', N, ',', load, ',', M, ',', maxdisp, ',', tinybits, ',', fullbits, &
+        ',', found_ok, ',', mq
+  print '(a,f0.1,a)', '# child-pointer space: tiny ', &
+        100.0*(1.0 - tinybits/fullbits), '% smaller than a full pointer'
+
+  deallocate(d_nkey, d_nval, d_ldisp, d_rdisp, d_qk, d_fcnt, d_chk)
+
+contains
+
+  ! arbitrary payload for a key
+  integer function payload(k)
+    integer, intent(in) :: k
+    payload = int(iand(int(k,8) * 2654435761_8, 2147483647_8))
+  end function payload
+
+  ! host murmur3 fmix64 (matches hmix64_d exactly)
+  integer(8) function hmix64_h(key) result(x)
+    integer(8), intent(in) :: key
+    x = key
+    x = ieor(x, ishft(x, -33))
+    x = x * (-49064778989728563_8)
+    x = ieor(x, ishft(x, -33))
+    x = x * (-4265267296055464365_8)
+    x = ieor(x, ishft(x, -33))
+    x = iand(x, 9223372036854775807_8)
+  end function hmix64_h
+
+  ! Place node for [lo,hi] with this path-id; recurse; return its displacement.
+  ! Records child displacements as the node's tiny pointers. Lossless.
+  recursive integer function place_build(lo, hi, pathid) result(disp)
+    integer,    intent(in) :: lo, hi
+    integer(8), intent(in) :: pathid
+    integer :: mid, home, idx, ld, rd
+    if (lo > hi) then; disp = -1; return; end if
+    mid  = (lo + hi) / 2
+    home = int(mod(hmix64_h(pathid), int(M, 8)))      ! 0-based home cell
+    disp = 0
+    do while (h_occ(mod(home + disp, M) + 1) /= 0)     ! linear probe; remember distance
+      disp = disp + 1
+    end do
+    idx = mod(home + disp, M)                          ! 0-based slot
+    h_occ(idx + 1)  = 1
+    h_nkey(idx + 1) = int(mid, 8)                      ! sorted keys 1..N => key = mid
+    h_nval(idx + 1) = payload(mid)
+    if (disp > maxdisp) maxdisp = disp
+    ld = place_build(lo, mid - 1, 2_8 * pathid)
+    rd = place_build(mid + 1, hi, 2_8 * pathid + 1_8)
+    h_ldisp(idx + 1) = ld
+    h_rdisp(idx + 1) = rd
+  end function place_build
+
+end program succinctbst

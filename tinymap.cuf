@@ -1,0 +1,267 @@
+! ============================================================================
+!  tinymap.cuf  --  a reusable tiny-pointer dereference table for the GPU.
+!
+!  Generic design (per arXiv:2111.12800): the table maps a 64-bit KEY to a
+!  compact 32-bit SLOT index. The caller keeps values/payloads in their own
+!  array indexed by that slot -- so the table is value-type agnostic.
+!
+!  Two ways to call it:
+!   * DEVICE-CALLABLE (fuse into your own kernels, no extra launch):
+!        slot = ttd_find(store, nbkt, B, key)      ! -1 if absent
+!        slot = ttd_insert(store, nbkt, B, key)     ! -1 if bucket full
+!   * HOST BULK helpers:
+!        call tt_create(map, nkeys, B, loadfactor)
+!        call tt_build (map, d_keys, d_rowids, n, nfail)
+!        call tt_destroy(map)
+!
+!  A linear-probing baseline (lpd_find/lpd_insert + lp_* host helpers) is
+!  included so applications can A/B the two with identical call sites.
+! ============================================================================
+
+module tinymap
+  use cudafor
+  implicit none
+  integer(8), parameter :: EMPTY64 = -1_8
+  integer,    parameter :: TT_TPB  = 256
+
+  ! A bundled handle for the bulk/host API. Device functions take raw arrays,
+  ! so they stay usable from inside arbitrary user kernels.
+  type tiny_map
+    integer(8), device, allocatable :: store(:)     ! holds keys; size nslots
+    integer,    device, allocatable :: payload(:)   ! caller value per slot
+    integer :: nbkt     = 0
+    integer :: B        = 0
+    integer :: nslots   = 0
+    integer :: ovf_base = 0    ! start of linear-probe overflow region (= nbkt*B)
+    integer :: ovf_cap  = 0    ! size of overflow region (the "backup table")
+  end type tiny_map
+
+contains
+
+  ! ---- murmur3 fmix64 -> bucket in [0, nbkt) (nbkt arbitrary) -------------
+  attributes(device) integer function tt_bucket(key, nbkt) result(b)
+    integer(8), value :: key
+    integer,    value :: nbkt
+    integer(8) :: x
+    x = key
+    x = ieor(x, ishft(x, -33))
+    x = x * (-49064778989728563_8)        ! 0xff51afd7ed558ccd
+    x = ieor(x, ishft(x, -33))
+    x = x * (-4265267296055464365_8)      ! 0xc4ceb9fe1a85ec53
+    x = ieor(x, ishft(x, -33))
+    x = iand(x, 9223372036854775807_8)    ! drop sign bit
+    b = int(mod(x, int(nbkt, 8)))
+  end function tt_bucket
+
+  ! ===================== TINY-POINTER device API ==========================
+  attributes(device) integer function ttd_find(store, nbkt, B, key) result(slot)
+    integer(8), device :: store(*)
+    integer,    value  :: nbkt, B
+    integer(8), value  :: key
+    integer :: base, j
+    base = tt_bucket(key, nbkt) * B
+    slot = -1
+    do j = 0, B - 1
+      if (store(base + j + 1) == key) then
+        slot = base + j                    ! ONE bucket, <= B contiguous reads
+        return
+      end if
+    end do
+  end function ttd_find
+
+  attributes(device) integer function ttd_insert(store, nbkt, B, key) result(slot)
+    integer(8), device :: store(*)
+    integer,    value  :: nbkt, B
+    integer(8), value  :: key
+    integer :: base, j
+    integer(8) :: old
+    base = tt_bucket(key, nbkt) * B
+    slot = -1
+    do j = 0, B - 1
+      old = atomiccas(store(base + j + 1), EMPTY64, key)
+      if (old == EMPTY64 .or. old == key) then
+        slot = base + j
+        return
+      end if
+    end do                                 ! bucket full -> slot stays -1
+  end function ttd_insert
+
+  ! ===================== RELIABLE (2-level) device API ====================
+  ! Bucket first; on a full bucket, fall back to a linear-probe overflow
+  ! region [ovf_base, ovf_base+ovf_cap) -- the paper's backup table. With a
+  ! modest overflow this NEVER drops a key, so it is safe for uses (a KV-cache,
+  ! a page table) where losing an entry is not an option.
+  attributes(device) integer function ttd_insert_r(store, nbkt, B, ovf_base, ovf_cap, key) result(slot)
+    integer(8), device :: store(*)
+    integer,    value  :: nbkt, B, ovf_base, ovf_cap
+    integer(8), value  :: key
+    integer :: base, j, i, s
+    integer(8) :: old
+    base = tt_bucket(key, nbkt) * B
+    slot = -1
+    do j = 0, B - 1
+      old = atomiccas(store(base + j + 1), EMPTY64, key)
+      if (old == EMPTY64 .or. old == key) then; slot = base + j; return; end if
+    end do
+    base = tt_bucket(key, ovf_cap)
+    do i = 0, ovf_cap - 1
+      s = base + i
+      if (s >= ovf_cap) s = s - ovf_cap
+      old = atomiccas(store(ovf_base + s + 1), EMPTY64, key)
+      if (old == EMPTY64 .or. old == key) then; slot = ovf_base + s; return; end if
+    end do
+  end function ttd_insert_r
+
+  attributes(device) integer function ttd_find_r(store, nbkt, B, ovf_base, ovf_cap, key) result(slot)
+    integer(8), device :: store(*)
+    integer,    value  :: nbkt, B, ovf_base, ovf_cap
+    integer(8), value  :: key
+    integer :: base, j, i, s
+    integer(8) :: v
+    base = tt_bucket(key, nbkt) * B
+    slot = -1
+    do j = 0, B - 1
+      if (store(base + j + 1) == key) then; slot = base + j; return; end if
+    end do
+    base = tt_bucket(key, ovf_cap)
+    do i = 0, ovf_cap - 1
+      s = base + i
+      if (s >= ovf_cap) s = s - ovf_cap
+      v = store(ovf_base + s + 1)
+      if (v == key) then; slot = ovf_base + s; return; end if
+      if (v == EMPTY64) return
+    end do
+  end function ttd_find_r
+
+  ! ===================== LINEAR-PROBE baseline device API =================
+  attributes(device) integer function lpd_find(store, cap, key) result(slot)
+    integer(8), device :: store(*)
+    integer,    value  :: cap
+    integer(8), value  :: key
+    integer :: base, i, s
+    integer(8) :: v
+    base = tt_bucket(key, cap)
+    slot = -1
+    do i = 0, cap - 1
+      s = base + i
+      if (s >= cap) s = s - cap
+      v = store(s + 1)
+      if (v == key) then; slot = s; return; end if
+      if (v == EMPTY64) return             ! unbounded, divergent probe chain
+    end do
+  end function lpd_find
+
+  attributes(device) integer function lpd_insert(store, cap, key) result(slot)
+    integer(8), device :: store(*)
+    integer,    value  :: cap
+    integer(8), value  :: key
+    integer :: base, i, s
+    integer(8) :: old
+    base = tt_bucket(key, cap)
+    slot = -1
+    do i = 0, cap - 1
+      s = base + i
+      if (s >= cap) s = s - cap
+      old = atomiccas(store(s + 1), EMPTY64, key)
+      if (old == EMPTY64 .or. old == key) then; slot = s; return; end if
+    end do
+  end function lpd_insert
+
+  ! ===================== kernels for the bulk host API ====================
+  attributes(global) subroutine k_init(store, n)
+    integer(8), device :: store(n)
+    integer,    value  :: n
+    integer :: tid
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid <= n) store(tid) = EMPTY64
+  end subroutine k_init
+
+  attributes(global) subroutine k_build_tt(store, nbkt, B, keys, rowids, n, payload, failc)
+    integer(8), device :: store(*), keys(n)
+    integer,    device :: rowids(n), payload(*), failc(1)
+    integer,    value  :: nbkt, B, n
+    integer :: tid, slot, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > n) return
+    slot = ttd_insert(store, nbkt, B, keys(tid))
+    if (slot >= 0) then
+      payload(slot + 1) = rowids(tid)
+    else
+      istat = atomicadd(failc(1), 1)
+    end if
+  end subroutine k_build_tt
+
+  attributes(global) subroutine k_build_lp(store, cap, keys, rowids, n, payload, failc)
+    integer(8), device :: store(*), keys(n)
+    integer,    device :: rowids(n), payload(*), failc(1)
+    integer,    value  :: cap, n
+    integer :: tid, slot, istat
+    tid = (blockidx%x - 1) * blockdim%x + threadidx%x
+    if (tid > n) return
+    slot = lpd_insert(store, cap, keys(tid))
+    if (slot >= 0) then
+      payload(slot + 1) = rowids(tid)
+    else
+      istat = atomicadd(failc(1), 1)
+    end if
+  end subroutine k_build_lp
+
+  ! ===================== host bulk helpers ================================
+  subroutine tt_create(map, nkeys, B, loadfactor)
+    type(tiny_map), intent(inout) :: map
+    integer, intent(in) :: nkeys, B
+    real,    intent(in) :: loadfactor
+    integer :: istat
+    map%B      = B
+    map%nbkt   = max(1, int(ceiling(real(nkeys) / (real(B) * loadfactor))))
+    map%nslots = map%nbkt * B
+    if (allocated(map%store))   deallocate(map%store)
+    if (allocated(map%payload)) deallocate(map%payload)
+    allocate(map%store(map%nslots), map%payload(map%nslots))
+    call k_init<<<(map%nslots + TT_TPB - 1)/TT_TPB, TT_TPB>>>(map%store, map%nslots)
+    istat = cudaDeviceSynchronize()
+  end subroutine tt_create
+
+  ! reliable variant: adds a linear-probe overflow region of ovf_frac*nkeys
+  subroutine tt_create_r(map, nkeys, B, loadfactor, ovf_frac)
+    type(tiny_map), intent(inout) :: map
+    integer, intent(in) :: nkeys, B
+    real,    intent(in) :: loadfactor, ovf_frac
+    integer :: istat
+    map%B        = B
+    map%nbkt     = max(1, int(ceiling(real(nkeys) / (real(B) * loadfactor))))
+    map%ovf_base = map%nbkt * B
+    map%ovf_cap  = max(16, int(ceiling(real(nkeys) * ovf_frac)))
+    map%nslots   = map%ovf_base + map%ovf_cap
+    if (allocated(map%store))   deallocate(map%store)
+    if (allocated(map%payload)) deallocate(map%payload)
+    allocate(map%store(map%nslots), map%payload(map%nslots))
+    call k_init<<<(map%nslots + TT_TPB - 1)/TT_TPB, TT_TPB>>>(map%store, map%nslots)
+    istat = cudaDeviceSynchronize()
+  end subroutine tt_create_r
+
+  subroutine tt_build(map, d_keys, d_rowids, n, nfail)
+    type(tiny_map), intent(inout) :: map
+    integer(8), device :: d_keys(:)
+    integer,    device :: d_rowids(:)
+    integer, intent(in)  :: n
+    integer, intent(out) :: nfail
+    integer, device, allocatable :: d_fail(:)
+    integer :: blocks, istat
+    allocate(d_fail(1)); d_fail = 0
+    blocks = (n + TT_TPB - 1) / TT_TPB
+    call k_build_tt<<<blocks, TT_TPB>>>(map%store, map%nbkt, map%B, d_keys, &
+                                        d_rowids, n, map%payload, d_fail)
+    istat = cudaDeviceSynchronize()
+    nfail = d_fail(1)
+    deallocate(d_fail)
+  end subroutine tt_build
+
+  subroutine tt_destroy(map)
+    type(tiny_map), intent(inout) :: map
+    if (allocated(map%store))   deallocate(map%store)
+    if (allocated(map%payload)) deallocate(map%payload)
+    map%nbkt = 0; map%B = 0; map%nslots = 0
+  end subroutine tt_destroy
+
+end module tinymap
